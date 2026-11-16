@@ -149,9 +149,24 @@ implementation. Generic GCM/CCM can use its CTR implementation while doing
 GHASH/CBC-MAC in software. Check the instantiated AEAD's driver name in
 `/proc/crypto`; CPU AES implementations may otherwise win algorithm selection.
 
-The standalone `tls_rx_bench.c` and existing TLS selftests are available in
-the Linux branch linked above. Run both TLS versions and both directions,
-including splice, and retain plaintext verification when comparing results.
+The standalone
+[`tls_rx_bench.c`](https://github.com/LGA1150/linux/blob/tls-rx-pipelining-v6.18/tools/testing/selftests/net/tls_rx_bench.c)
+and existing TLS selftests are available in the Linux branch. The benchmark
+accepts `-c gcm|ccm` and `-k 128|256`, with AES-GCM-128 as the default. kTLS
+supports AES-GCM-128, AES-GCM-256 and AES-CCM-128 with a 16-byte tag;
+AES-192, AES-CCM-256 and CCM-8 are not exposed by its UAPI.
+
+For example, after building the standalone benchmark on your test system:
+
+```sh
+./tls_rx_bench -d tx -c gcm -k 256 -j 4
+./tls_rx_bench -d tx -c ccm -k 128 -m splice -j 4
+./tls_rx_bench -d rx -c ccm -k 128 -v 1.2
+```
+
+Run both TLS versions and both directions, including splice, and retain
+plaintext verification when comparing results. Cipher selection also applies
+to preparation, every worker and the untimed verification pass.
 
 No kernel, module, toolchain, benchmark or selftest build was run when adding
 these packages. Validation was limited to source/patch and package metadata
