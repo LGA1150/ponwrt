@@ -57,6 +57,9 @@ TLS 1.2 TX benchmark passed on the device. Release 8 removed the algorithms'
 `cra_alignmask` initializers. Release 10 restores release 8's driver sources
 after removing the 4-byte SG offset check in release 9 caused a TLS 1.2 RX
 plaintext mismatch. The same command passes with release 8 on the device.
+Release 11 adds HMAC key normalization, authentication tag validation, and
+two fixes to PonWrt's small-request fallback. It retains the 4-byte SG
+offset check and does not change the DMA burst configuration.
 
 The EIP93 patches apply in filename order, with each fix in its own commit:
 
@@ -73,13 +76,34 @@ The EIP93 patches apply in filename order, with each fix in its own commit:
 | **009** | **Queue requests and wait for ring/request-ID credits: the backpressure fix.** |
 | **010** | **Bounce DMA-written SG ranges that do not own complete cache lines.** |
 | 011 | Remove Crypto API alignment masks; keep the driver's DMA alignment and bounce handling. |
+| 013 | Use the full hash digest when shortening a long HMAC key, independently of tag truncation. |
+| 014 | Reject authentication tag sizes that the hardware's word-count field cannot represent. |
+| 015 | Apply the generic software fallback threshold to AES-192/256. |
+| 016 | Free the software fallback if cipher SA allocation fails during initialization. |
 
-Apply the complete series through 011. Patch 012 has been withdrawn after
+Apply all fifteen patches in filename order through 016. Patch 012 remains withdrawn after
 the device regression. Patches 004–008 make preparation, completion and
 ring reuse safe for deferred
 submission; they are separate so these changes can be reviewed and bisected.
 The previous IDR-only package remains available at
 [revision f600a23](https://github.com/LGA1150/ponwrt/tree/f600a2304d24ad8e8f403c10789a8d107cac9e6f/package/kernel/eip93).
+
+Patches 001–009 are also available as individual commits against Linux
+`master` on the
+[`eip93-backpressure` review branch](https://github.com/LGA1150/linux/compare/master...eip93-backpressure).
+
+Patch 013 fixes authenc HMAC keys longer than the 64-byte hash block size.
+For example, HMAC-SHA256 must use all 32 bytes of the shortened key even
+when the requested tag is only 16 bytes. Patch 014 rejects tag sizes that
+are not multiples of four instead of silently rounding down the hardware
+digest length; the AEAD core already rejects zero and oversized tags.
+These two patches affect HMAC/authenc rather than the generic GCM/CCM
+constructions used by the TLS benchmark.
+
+Patch 015 fixes an always-true conditional in PonWrt's fallback patch.
+With this package's settings, AES-192/256 requests longer than 256 bytes
+now use hardware; AES-128 retains the 512-byte software threshold. Patch
+016 releases the already allocated fallback when SA allocation fails.
 
 The worker handles skcipher, AEAD and hash requests because they share the
 same hardware resources. It keeps multiple requests in flight, up to the
@@ -317,6 +341,20 @@ UBSan; it does not reproduce the physical device's failure.
 These checks do not produce or test a loadable Airoha module. Release 5's
 TLS 1.3 TX pass and release 7's TLS 1.2 TX pass are from device testing.
 The TLS 1.2 RX comparison (release 8 passes, release 9 fails) is also from
-device testing. Release 10 restores release 8's identical driver sources;
-the rebuilt package still needs installation and validation on the device.
+device testing. Release 10 restored release 8's identical driver sources.
+Release 11's four additional patches each compile and link with host GCC
+and `W=1`, and pass strict checkpatch. Fresh application of all fifteen
+patches reproduces the compiled sources without fuzz or offsets.
+
+A host HMAC regression test runs the actual old and new key setup helpers
+with OpenSSL-backed synchronous hash stubs. It verifies 288 cases across
+MD5, SHA-1, SHA-224 and SHA-256, including RFC 4231 case 6, both pad setup
+paths, long and short keys, and truncated and full tags. It reproduces 120
+incorrect outputs from the old helper. A second test runs the actual AEAD
+core and driver tag-size setters: 108 cases verify supported lengths and
+unchanged state on rejection, reproducing 72 silent truncations in the old
+driver. Both tests pass AddressSanitizer and UBSan. These tests do not run
+the hardware hash engine.
+
+Release 11 still needs installation and validation on the device.
 No firmware, toolchain or benchmark was rebuilt.
