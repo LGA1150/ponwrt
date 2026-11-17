@@ -1,0 +1,64 @@
+From 3354926c688ebb91fff4280594c46fb6a72809d8 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 11:45:27 +0800
+Subject: [PATCH] crypto: eip93 - isolate streaming DMA cache lines
+
+Checking word-aligned addresses and cipher-block lengths is insufficient
+for streaming DMA on a non-coherent device. Independent requests may
+share a cache line, and cleaning it for one request can overwrite data
+already written by the engine for another request. kTLS can pack records
+into adjacent page fragments, and generic GCM also supplies a 16-byte
+mask block from its request context.
+
+Require cache-aligned offsets and complete SG-entry lengths before using
+the direct DMA path. Check the entire mapped entry even when cryptlen
+ends before its end. Use the existing bounce path otherwise, and round
+its private mapping up to a cache-line boundary without changing the
+number of bytes encrypted or copied back.
+
+This fixes an unsafe mapping accepted by the driver. It is a candidate
+for the intermittent TLS 1.2 plaintext mismatch seen on AN7581; device
+validation is still needed to establish whether it explains that report.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-common.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index d23e2cf..462d1a5 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -196,7 +196,8 @@ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+ 	}
+ 
+ 	sg_init_table(*dst, 1);
+-	sg_set_buf(*dst, pages, len);
++	/* The page allocation owns the padding through the last cache line. */
++	sg_set_buf(*dst, pages, ALIGN(len, dma_get_cache_alignment()));
+ 
+ 	/* copy only as requested */
+ 	if (copy)
+@@ -208,12 +209,22 @@ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+ 				const int blksize)
+ {
++	unsigned int dma_align = dma_get_cache_alignment();
+ 	int nents;
+ 
+ 	for (nents = 0; sg; sg = sg_next(sg), ++nents) {
+ 		if (!IS_ALIGNED(sg->offset, 4))
+ 			return false;
+ 
++		/*
++		 * Adjacent requests must not share a streaming DMA cache line.
++		 * dma_map_sg() maps the entire entry, including any bytes beyond
++		 * the requested crypt length in the last entry.
++		 */
++		if (!IS_ALIGNED(sg->offset, dma_align) ||
++		    !IS_ALIGNED(sg->length, dma_align))
++			return false;
++
+ 		if (len <= sg->length) {
+ 			if (!IS_ALIGNED(len, blksize))
+ 				return false;
