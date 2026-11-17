@@ -1,0 +1,312 @@
+From 4c2457fa7fda36dfefd54a2dbb39adf8b498f169 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 10:15:32 +0800
+Subject: [PATCH] crypto: eip93 - unwind cipher request preparation failures
+
+Prepare skcipher and AEAD requests in the shared submission function so
+validation failures return synchronously without also invoking completion.
+Discard any bounce buffers on failure without copying uninitialized output.
+
+Keep the SA mapping in the request rather than the shared transform and
+unmap it on completion or preparation failure. Unwind only successfully
+mapped IV state and data buffers, and return negative DMA mapping errors.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-aead.c   | 27 +--------------------
+ eip93-cipher.c | 28 +---------------------
+ eip93-cipher.h |  3 ---
+ eip93-common.c | 65 ++++++++++++++++++++++++++++++++++++--------------
+ 4 files changed, 49 insertions(+), 74 deletions(-)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 18dd8a9..2b2e096 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -40,21 +40,6 @@ void eip93_aead_handle_result(struct crypto_async_request *async, int err)
+ 	aead_request_complete(req, err);
+ }
+ 
+-static int eip93_aead_send_req(struct crypto_async_request *async)
+-{
+-	struct aead_request *req = aead_request_cast(async);
+-	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+-	int err;
+-
+-	err = check_valid_request(rctx);
+-	if (err) {
+-		aead_request_complete(req, err);
+-		return err;
+-	}
+-
+-	return eip93_send_req(async, req->iv, rctx);
+-}
+-
+ /* Crypto aead API functions */
+ static int eip93_aead_cra_init(struct crypto_tfm *tfm)
+ {
+@@ -81,8 +66,6 @@ static void eip93_aead_cra_exit(struct crypto_tfm *tfm)
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	dma_unmap_single(ctx->eip93->dev, ctx->sa_record_base,
+-			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+ 	kfree(ctx->sa_record);
+ }
+ 
+@@ -189,13 +172,6 @@ static int eip93_aead_crypt(struct aead_request *req)
+ 	struct crypto_async_request *async = &req->base;
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	struct crypto_aead *aead = crypto_aead_reqtfm(req);
+-	int ret;
+-
+-	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
+-					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+-	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
+-	if (ret)
+-		return ret;
+ 
+ 	rctx->textsize = req->cryptlen;
+ 	rctx->blksize = ctx->blksize;
+@@ -205,12 +181,11 @@ static int eip93_aead_crypt(struct aead_request *req)
+ 	rctx->sg_dst = req->dst;
+ 	rctx->ivsize = crypto_aead_ivsize(aead);
+ 	rctx->desc_flags = EIP93_DESC_AEAD;
+-	rctx->sa_record_base = ctx->sa_record_base;
+ 
+ 	if (IS_DECRYPT(rctx->flags))
+ 		rctx->textsize -= rctx->authsize;
+ 
+-	return eip93_aead_send_req(async);
++	return eip93_send_req(async, req->iv, rctx);
+ }
+ 
+ static int eip93_aead_encrypt(struct aead_request *req)
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index b9ea692..df12036 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -37,22 +37,6 @@ static inline bool eip93_skcipher_is_fallback(const struct crypto_tfm *tfm,
+ 		!IS_RFC3686(flags);
+ }
+ 
+-static int eip93_skcipher_send_req(struct crypto_async_request *async)
+-{
+-	struct skcipher_request *req = skcipher_request_cast(async);
+-	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
+-	int err;
+-
+-	err = check_valid_request(rctx);
+-
+-	if (err) {
+-		skcipher_request_complete(req, err);
+-		return err;
+-	}
+-
+-	return eip93_send_req(async, req->iv, rctx);
+-}
+-
+ /* Crypto skcipher API functions */
+ static int eip93_skcipher_cra_init(struct crypto_tfm *tfm)
+ {
+@@ -88,8 +72,6 @@ static void eip93_skcipher_cra_exit(struct crypto_tfm *tfm)
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	dma_unmap_single(ctx->eip93->dev, ctx->sa_record_base,
+-			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+ 	kfree(ctx->sa_record);
+ 
+ 	crypto_free_skcipher(ctx->fallback);
+@@ -166,7 +148,6 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
+ 	bool fallback = eip93_skcipher_is_fallback(req->base.tfm, rctx->flags);
+-	int ret;
+ 
+ 	if (!req->cryptlen)
+ 		return 0;
+@@ -195,12 +176,6 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 				 crypto_skcipher_decrypt(&rctx->fallback_req);
+ 	}
+ 
+-	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
+-					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+-	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
+-	if (ret)
+-		return ret;
+-
+ 	rctx->assoclen = 0;
+ 	rctx->textsize = req->cryptlen;
+ 	rctx->authsize = 0;
+@@ -209,9 +184,8 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 	rctx->ivsize = crypto_skcipher_ivsize(skcipher);
+ 	rctx->blksize = ctx->blksize;
+ 	rctx->desc_flags = EIP93_DESC_SKCIPHER;
+-	rctx->sa_record_base = ctx->sa_record_base;
+ 
+-	return eip93_skcipher_send_req(async);
++	return eip93_send_req(async, req->iv, rctx);
+ }
+ 
+ static int eip93_skcipher_encrypt(struct skcipher_request *req)
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index b61ff4a..862321d 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -16,7 +16,6 @@ struct eip93_crypto_ctx {
+ 	struct sa_record		*sa_record;
+ 	u32				sa_nonce;
+ 	int				blksize;
+-	dma_addr_t			sa_record_base;
+ 	/* AEAD specific */
+ 	unsigned int			authsize;
+ 	unsigned int			assoclen;
+@@ -46,8 +45,6 @@ struct eip93_cipher_reqctx {
+ 	struct skcipher_request		fallback_req;
+ };
+ 
+-int check_valid_request(struct eip93_cipher_reqctx *rctx);
+-
+ void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 		     struct scatterlist *reqsrc, struct scatterlist *reqdst);
+ 
+diff --git a/eip93-common.c b/eip93-common.c
+index 43a2df5..d91dbeb 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -198,7 +198,7 @@ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+ 	return false;
+ }
+ 
+-int check_valid_request(struct eip93_cipher_reqctx *rctx)
++static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ {
+ 	struct scatterlist *src = rctx->sg_src;
+ 	struct scatterlist *dst = rctx->sg_dst;
+@@ -515,6 +515,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	struct eip93_device *eip93 = ctx->eip93;
+ 	struct scatterlist *src = rctx->sg_src;
+ 	struct scatterlist *dst = rctx->sg_dst;
++	struct scatterlist *reqsrc = src, *reqdst = dst;
+ 	struct sa_state *sa_state;
+ 	struct eip93_descriptor cdesc;
+ 	u32 flags = rctx->flags;
+@@ -528,14 +529,29 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	rctx->sa_state_ctr = NULL;
+ 	rctx->sa_state = NULL;
+ 
++	err = check_valid_request(rctx);
++	if (err)
++		goto free_sg_copy;
++	src = rctx->sg_src;
++	dst = rctx->sg_dst;
++
++	rctx->sa_record_base = dma_map_single(eip93->dev, ctx->sa_record,
++					      sizeof(*ctx->sa_record), DMA_TO_DEVICE);
++	if (dma_mapping_error(eip93->dev, rctx->sa_record_base)) {
++		err = -ENOMEM;
++		goto free_sg_copy;
++	}
++
+ 	if (IS_ECB(flags))
+ 		goto skip_iv;
+ 
+ 	memcpy(iv, reqiv, rctx->ivsize);
+ 
+ 	rctx->sa_state = kzalloc(sizeof(*rctx->sa_state), GFP_KERNEL);
+-	if (!rctx->sa_state)
+-		return -ENOMEM;
++	if (!rctx->sa_state) {
++		err = -ENOMEM;
++		goto unmap_sa_record;
++	}
+ 
+ 	sa_state = rctx->sa_state;
+ 
+@@ -574,17 +590,19 @@ int eip93_send_req(struct crypto_async_request *async,
+ 			rctx->sa_state_ctr_base = dma_map_single(eip93->dev, rctx->sa_state_ctr,
+ 								 sizeof(*rctx->sa_state_ctr),
+ 								 DMA_TO_DEVICE);
+-			err = dma_mapping_error(eip93->dev, rctx->sa_state_ctr_base);
+-			if (err)
++			if (dma_mapping_error(eip93->dev, rctx->sa_state_ctr_base)) {
++				err = -ENOMEM;
+ 				goto free_sa_state_ctr;
++			}
+ 		}
+ 	}
+ 
+ 	rctx->sa_state_base = dma_map_single(eip93->dev, rctx->sa_state,
+ 					     sizeof(*rctx->sa_state), DMA_TO_DEVICE);
+-	err = dma_mapping_error(eip93->dev, rctx->sa_state_base);
+-	if (err)
+-		goto free_sa_state_ctr_dma;
++	if (dma_mapping_error(eip93->dev, rctx->sa_state_base)) {
++		err = -ENOMEM;
++		goto unmap_sa_state_ctr;
++	}
+ 
+ skip_iv:
+ 
+@@ -607,32 +625,40 @@ skip_iv:
+ 	 */
+ 	if (!dma_map_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL)) {
+ 		err = -ENOMEM;
+-		goto free_sa_state_ctr_dma;
++		goto unmap_sa_state;
+ 	}
+ 
+ 	if (src != dst &&
+ 	    !dma_map_sg(eip93->dev, src, rctx->src_nents, DMA_TO_DEVICE)) {
+ 		err = -ENOMEM;
+-		goto free_sg_dma;
++		goto unmap_sg_dst;
+ 	}
+ 
+ 	return eip93_scatter_combine(eip93, rctx, datalen, split, offsetin);
+ 
+-free_sg_dma:
++unmap_sg_dst:
+ 	dma_unmap_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL);
+-free_sa_state_ctr_dma:
++unmap_sa_state:
++	if (rctx->sa_state)
++		dma_unmap_single(eip93->dev, rctx->sa_state_base,
++				 sizeof(*rctx->sa_state), DMA_TO_DEVICE);
++unmap_sa_state_ctr:
+ 	if (rctx->sa_state_ctr)
+ 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
+-				 sizeof(*rctx->sa_state_ctr),
+-				 DMA_TO_DEVICE);
++				 sizeof(*rctx->sa_state_ctr), DMA_TO_DEVICE);
+ free_sa_state_ctr:
+ 	kfree(rctx->sa_state_ctr);
+-	if (rctx->sa_state)
+-		dma_unmap_single(eip93->dev, rctx->sa_state_base,
+-				 sizeof(*rctx->sa_state),
+-				 DMA_TO_DEVICE);
+ free_sa_state:
+ 	kfree(rctx->sa_state);
++unmap_sa_record:
++	dma_unmap_single(eip93->dev, rctx->sa_record_base,
++			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
++free_sg_copy:
++	/* No descriptor was submitted: discard bounce buffers without copyback. */
++	if (rctx->sg_src != reqsrc)
++		eip93_free_sg_copy(datalen + rctx->authsize, &rctx->sg_src);
++	if (rctx->sg_dst != reqdst)
++		eip93_free_sg_copy(datalen + rctx->authsize, &rctx->sg_dst);
+ 
+ 	return err;
+ }
+@@ -684,6 +710,9 @@ process_tag:
+ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 			 u8 *reqiv)
+ {
++	dma_unmap_single(eip93->dev, rctx->sa_record_base,
++			 sizeof(struct sa_record), DMA_TO_DEVICE);
++
+ 	if (rctx->sa_state_ctr)
+ 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
+ 				 sizeof(*rctx->sa_state_ctr),
