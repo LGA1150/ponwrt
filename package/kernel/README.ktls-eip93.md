@@ -48,26 +48,24 @@ It must not be used with NIC drivers compiled against the original RX layout.
 `kmod-eip93` uses the target's existing EIP93 implementation,
 including PonWrt's small-request software fallback patch. The fallback
 configuration matches the stock package (generic: 256 bytes; AES-128: 512
-bytes). Its ordered package patches cover:
+bytes). Release 4 applies only the three IDR patches for the first hardware test:
 
-1. Cipher preparation cleanup and synchronous error returns.
-2. Allocation flags for callers that cannot sleep.
-3. Bidirectional DMA mappings for cipher IV state.
-4. Checked cipher request-ID reservation and release.
-5. Hash request-ID reservation before intermediate blocks are submitted.
-6. Hash DMA bookkeeping published before descriptor submission.
-7. Diagnostics for unmatched completion IDs.
+1. Reserve and check cipher request IDs before DMA or bounce preparation,
+   and release the ID when the request returns synchronously.
+2. Reserve hash request IDs before submitting any intermediate blocks,
+   and release the ID when no asynchronous completion will follow.
+3. Log unmatched completion IDs and skip the NULL request.
 
-Apply the series in filename order. Patch 004 uses the cleanup paths from
-001; patch 005 uses the checked ID allocator introduced by 004.
-The series reserves and checks request IDs before preparing
-cipher requests or submitting hash blocks, releases IDs and cipher DMA/bounce
-resources on preparation failure, and balances cipher SA/IV mappings. Errors
-before cipher submission return synchronously without a completion callback.
-ID allocation failures and unmatched completion IDs produce rate-limited
-diagnostics; an unmatched completion is skipped instead of dereferencing NULL.
+Apply the series in filename order. Patch 002 uses the checked ID allocator
+from 001. The cipher fix is independent of the broader cleanup and DMA fixes.
+Failed ID allocations return before hardware submission or a callback.
+Existing DMA mapping, bounce-buffer cleanup, allocation flags and hash
+descriptor-publication behavior are retained to isolate IDR handling.
+The broader seven-patch series remains available in
+[revision 6122d6e](https://github.com/LGA1150/ponwrt/tree/6122d6e4d427a6220bed0668d016ca4864588561/package/kernel/eip93/patches)
+for later testing.
 
-This series rejects ID exhaustion with `-ENOSPC` and allocation failure with
+This series rejects ID exhaustion with `-ENOSPC` and IDR allocation failure with
 `-ENOMEM`. It does not add a software backlog or replace the descriptor-ring
 retry loop. If `Missing request:` still appears, retain its ID, flags and status
 words: the driver cannot recover the original request from an unmatched ID,
@@ -77,6 +75,15 @@ Add further driver experiments under `package/kernel/eip93/patches/`.
 It supports the same Airoha and MT7621 targets as the stock EIP93 package.
 AN7581 and AN7583 already have enabled EIP93 device-tree nodes in this fork.
 Other boards still need a suitable enabled device-tree node.
+
+For this first test, rebuild and install only `kmod-eip93`, keep stock kTLS,
+and rerun `./tls_rx_bench -d tx` with console logging enabled. Retain these
+rate-limited messages if they appear:
+
+- `Failed to allocate request ID: -28`: the IDR has no free request IDs.
+- `Failed to allocate request ID: -12`: allocation failed with `-ENOMEM`.
+- `Missing request: ...`: a completion ID has no matching tracked request;
+  retain its ID, flags, control and length words for further diagnosis.
 
 ## Select the packages
 
@@ -194,8 +201,9 @@ plaintext verification when comparing results. Cipher selection also applies
 to preparation, every worker and the untimed verification pass.
 
 The initial package validation used source/patch and package metadata checks.
-Each intermediate version of the EIP93 series was compiled with host GCC 14.2 and
-`W=1` against prepared Linux 6.18 x86-64 headers, including PonWrt's fallback
+Each intermediate version of the three-patch IDR series was compiled with
+host GCC 14.2 and `W=1` against prepared Linux 6.18 x86-64 headers, including
+PonWrt's fallback
 patch and settings. All five driver objects compiled and linked into
 `crypto-hw-eip93.o`; this is a host compile check, not a loadable Airoha module
 or a hardware runtime test. No firmware, toolchain or benchmark was rebuilt.
