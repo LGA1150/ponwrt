@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=eip93
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=GPL-2.0-only
 PKG_BUILD_PARALLEL:=1
 
@@ -33,6 +33,7 @@ define KernelPackage/eip93/description
   EIP93 Crypto API driver for Airoha and MediaTek MT7621, built outside
   the kernel source tree. Retains the target kernel's stable fixes and
   PonWrt patches, including software fallback for small AES requests.
+  Handles request-ID allocation failures before hardware submission.
   Replaces kmod-crypto-hw-eip93 and can be patched and rebuilt separately.
 endef
 

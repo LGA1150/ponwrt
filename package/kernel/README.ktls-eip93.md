@@ -45,10 +45,35 @@ bypass (`CONFIG_TLS_TOE`) are disabled. The patched receive-context header is
 private to this module and is placed before the base kernel's include paths.
 It must not be used with NIC drivers compiled against the original RX layout.
 
-`kmod-eip93` initially uses the target's existing EIP93 implementation,
+`kmod-eip93` uses the target's existing EIP93 implementation,
 including PonWrt's small-request software fallback patch. The fallback
 configuration matches the stock package (generic: 256 bytes; AES-128: 512
-bytes). Add driver experiments under `package/kernel/eip93/patches/`.
+bytes). Its ordered package patches cover:
+
+1. Cipher preparation cleanup and synchronous error returns.
+2. Allocation flags for callers that cannot sleep.
+3. Bidirectional DMA mappings for cipher IV state.
+4. Checked cipher request-ID reservation and release.
+5. Hash request-ID reservation before intermediate blocks are submitted.
+6. Hash DMA bookkeeping published before descriptor submission.
+7. Diagnostics for unmatched completion IDs.
+
+Apply the series in filename order. Patch 004 uses the cleanup paths from
+001; patch 005 uses the checked ID allocator introduced by 004.
+The series reserves and checks request IDs before preparing
+cipher requests or submitting hash blocks, releases IDs and cipher DMA/bounce
+resources on preparation failure, and balances cipher SA/IV mappings. Errors
+before cipher submission return synchronously without a completion callback.
+ID allocation failures and unmatched completion IDs produce rate-limited
+diagnostics; an unmatched completion is skipped instead of dereferencing NULL.
+
+This series rejects ID exhaustion with `-ENOSPC` and allocation failure with
+`-ENOMEM`. It does not add a software backlog or replace the descriptor-ring
+retry loop. If `Missing request:` still appears, retain its ID, flags and status
+words: the driver cannot recover the original request from an unmatched ID,
+and its caller may remain waiting. The observed crash established a NULL
+request lookup; ID exhaustion has not yet been confirmed on hardware.
+Add further driver experiments under `package/kernel/eip93/patches/`.
 It supports the same Airoha and MT7621 targets as the stock EIP93 package.
 AN7581 and AN7583 already have enabled EIP93 device-tree nodes in this fork.
 Other boards still need a suitable enabled device-tree node.
@@ -168,6 +193,9 @@ Run both TLS versions and both directions, including splice, and retain
 plaintext verification when comparing results. Cipher selection also applies
 to preparation, every worker and the untimed verification pass.
 
-No kernel, module, toolchain, benchmark or selftest build was run when adding
-these packages. Validation was limited to source/patch and package metadata
-checks.
+The initial package validation used source/patch and package metadata checks.
+Each intermediate version of the EIP93 series was compiled with host GCC 14.2 and
+`W=1` against prepared Linux 6.18 x86-64 headers, including PonWrt's fallback
+patch and settings. All five driver objects compiled and linked into
+`crypto-hw-eip93.o`; this is a host compile check, not a loadable Airoha module
+or a hardware runtime test. No firmware, toolchain or benchmark was rebuilt.
