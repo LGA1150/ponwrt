@@ -52,10 +52,11 @@ bytes). Release 5 added async backpressure after the device test confirmed
 `Failed to allocate request ID: -28` under the default TX benchmark. The IDR
 checks in release 4 prevented the NULL-request panic, but returned `-ENOSPC`
 to stock kTLS, which aborted transmission with `EBADMSG`.
-Release 7 applies cache-line isolation to DMA-written buffers; read-only
-sources retain their hardware alignment checks. The default TLS 1.2 TX
-benchmark now passes on the device. Release 8 removes the algorithms'
-`cra_alignmask` initializers while retaining the driver's DMA checks.
+Release 7 added cache-line isolation to DMA-written buffers, and the default
+TLS 1.2 TX benchmark passed on the device. Release 8 removed the algorithms'
+`cra_alignmask` initializers. Release 9 also removes the 4-byte SG offset
+check, retaining cipher-block length checks and DMA-written cache-line
+isolation.
 
 The EIP93 patches apply in filename order, with each fix in its own commit:
 
@@ -72,8 +73,9 @@ The EIP93 patches apply in filename order, with each fix in its own commit:
 | **009** | **Queue requests and wait for ring/request-ID credits: the backpressure fix.** |
 | **010** | **Bounce DMA-written SG ranges that do not own complete cache lines.** |
 | 011 | Remove Crypto API alignment masks; keep the driver's DMA alignment and bounce handling. |
+| 012 | Remove the 4-byte SG offset check; retain block-length checks and DMA-written cache-line isolation. |
 
-Apply the complete series through 011 for the next test. Patches
+Apply the complete series through 012 for the next test. Patches
 004–008 make preparation, completion and ring reuse safe for deferred
 submission; they are separate so these changes can be reviewed and bisected.
 The previous IDR-only package remains available at
@@ -103,7 +105,7 @@ non-coherent SoC. The new check applies to destinations and in-place
 buffers mapped `DMA_BIDIRECTIONAL`, covering the full SG entry including
 bytes beyond cryptlen. Read-only `DMA_TO_DEVICE` sources do not need this
 cache-line restriction: cleaning is non-destructive for them. Their
-existing EIP93 address and cipher-block alignment checks still apply.
+cipher-block length checks still apply.
 Private bounce mappings cover whole cache lines.
 
 `CONFIG_DMA_BOUNCE_UNALIGNED_KMALLOC` is enabled on this target. In Linux
@@ -126,9 +128,18 @@ Patch 011 removes the AES skciphers' `0xf` alignment masks and the redundant
 zero initializers for the other skciphers and AEAD algorithms. The default
 mask is zero: the Crypto API no longer sees an additional caller alignment
 requirement. Keys and IVs are copied into private storage, and AES key
-expansion supports unaligned input. The driver still checks hardware address
-and block alignment and isolates DMA-written cache lines, bouncing requests
-as needed before submission.
+expansion supports unaligned input. Driver preparation handles DMA mapping
+and bounce buffers before submission.
+
+Patch 012 removes `IS_ALIGNED(sg->offset, 4)` from the SG validation helper.
+The SHARC+ packet-engine manual's 4-byte minimum concerns ESP padding;
+the driver uses basic operations with stream padding disabled. Its source
+and destination registers describe byte addresses, and its DMA controller
+supports byte transfers. Read-only source offsets no longer trigger a
+bounce solely because they are not multiples of four. Cipher-block length
+checks and cache-line isolation for DMA-written/in-place buffers still
+apply. The host build cannot validate unaligned DMA on Airoha; device tests
+should include source offsets 1, 2 and 3 with otherwise block-sized data.
 
 For the next hardware test, rebuild and install only `kmod-eip93`, keep stock
 kTLS, and run with console logging enabled:
@@ -298,6 +309,6 @@ how the driver bounce path isolates it. The test used AddressSanitizer and
 UBSan; it does not reproduce the physical device's failure.
 
 These checks do not produce or test a loadable Airoha module. Release 5's
-TLS 1.3 TX pass and release 7's TLS 1.2 TX pass are from device testing;
-release 8 still needs device validation.
+TLS 1.3 TX pass and release 7's TLS 1.2 TX pass are from device testing.
+Release 9's relaxed alignment checks still need device validation.
 No firmware, toolchain or benchmark was rebuilt.
