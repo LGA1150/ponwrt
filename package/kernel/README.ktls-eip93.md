@@ -54,9 +54,9 @@ checks in release 4 prevented the NULL-request panic, but returned `-ENOSPC`
 to stock kTLS, which aborted transmission with `EBADMSG`.
 Release 7 added cache-line isolation to DMA-written buffers, and the default
 TLS 1.2 TX benchmark passed on the device. Release 8 removed the algorithms'
-`cra_alignmask` initializers. Release 9 also removes the 4-byte SG offset
-check, retaining cipher-block length checks and DMA-written cache-line
-isolation.
+`cra_alignmask` initializers. Release 10 restores release 8's driver sources
+after removing the 4-byte SG offset check in release 9 caused a TLS 1.2 RX
+plaintext mismatch. The same command passes with release 8 on the device.
 
 The EIP93 patches apply in filename order, with each fix in its own commit:
 
@@ -73,10 +73,10 @@ The EIP93 patches apply in filename order, with each fix in its own commit:
 | **009** | **Queue requests and wait for ring/request-ID credits: the backpressure fix.** |
 | **010** | **Bounce DMA-written SG ranges that do not own complete cache lines.** |
 | 011 | Remove Crypto API alignment masks; keep the driver's DMA alignment and bounce handling. |
-| 012 | Remove the 4-byte SG offset check; retain block-length checks and DMA-written cache-line isolation. |
 
-Apply the complete series through 012 for the next test. Patches
-004–008 make preparation, completion and ring reuse safe for deferred
+Apply the complete series through 011. Patch 012 has been withdrawn after
+the device regression. Patches 004–008 make preparation, completion and
+ring reuse safe for deferred
 submission; they are separate so these changes can be reviewed and bisected.
 The previous IDR-only package remains available at
 [revision f600a23](https://github.com/LGA1150/ponwrt/tree/f600a2304d24ad8e8f403c10789a8d107cac9e6f/package/kernel/eip93).
@@ -105,7 +105,7 @@ non-coherent SoC. The new check applies to destinations and in-place
 buffers mapped `DMA_BIDIRECTIONAL`, covering the full SG entry including
 bytes beyond cryptlen. Read-only `DMA_TO_DEVICE` sources do not need this
 cache-line restriction: cleaning is non-destructive for them. Their
-cipher-block length checks still apply.
+4-byte offset and cipher-block length checks still apply.
 Private bounce mappings cover whole cache lines.
 
 `CONFIG_DMA_BOUNCE_UNALIGNED_KMALLOC` is enabled on this target. In Linux
@@ -131,15 +131,21 @@ requirement. Keys and IVs are copied into private storage, and AES key
 expansion supports unaligned input. Driver preparation handles DMA mapping
 and bounce buffers before submission.
 
-Patch 012 removes `IS_ALIGNED(sg->offset, 4)` from the SG validation helper.
-The SHARC+ packet-engine manual's 4-byte minimum concerns ESP padding;
-the driver uses basic operations with stream padding disabled. Its source
-and destination registers describe byte addresses, and its DMA controller
-supports byte transfers. Read-only source offsets no longer trigger a
-bounce solely because they are not multiples of four. Cipher-block length
-checks and cache-line isolation for DMA-written/in-place buffers still
-apply. The host build cannot validate unaligned DMA on Airoha; device tests
-should include source offsets 1, 2 and 3 with otherwise block-sized data.
+Release 9's patch 012 removed `IS_ALIGNED(sg->offset, 4)` from SG validation.
+On Airoha with stock kTLS, `./ktls-bench -v 1.2` then reported
+`plaintext mismatch at record 8`; the same command passes with release 8.
+Release 10 withdraws patch 012 and restores the aligned bounce path while
+retaining the `cra_alignmask` removal and the destination cache-line fix.
+Its prepared driver sources are identical to release 8.
+
+TLS 1.2 GCM ciphertext follows a 5-byte header and an 8-byte explicit nonce,
+so RX scatterlists can start at non-word-aligned offsets. Whether a request
+uses direct DMA depends on its SG layout. GCM authenticates the input
+ciphertext separately from CTR decryption, so a faulty CTR DMA read can
+produce wrong plaintext despite successful tag verification. This is
+consistent with the regression; the exact hardware failure is not traced.
+The SHARC+ manual's ESP padding rule and support for byte-sized DMA tails
+do not establish support for arbitrary DMA starting addresses on Airoha.
 
 For the next hardware test, rebuild and install only `kmod-eip93`, keep stock
 kTLS, and run with console logging enabled:
@@ -310,5 +316,7 @@ UBSan; it does not reproduce the physical device's failure.
 
 These checks do not produce or test a loadable Airoha module. Release 5's
 TLS 1.3 TX pass and release 7's TLS 1.2 TX pass are from device testing.
-Release 9's relaxed alignment checks still need device validation.
+The TLS 1.2 RX comparison (release 8 passes, release 9 fails) is also from
+device testing. Release 10 restores release 8's identical driver sources;
+the rebuilt package still needs installation and validation on the device.
 No firmware, toolchain or benchmark was rebuilt.
