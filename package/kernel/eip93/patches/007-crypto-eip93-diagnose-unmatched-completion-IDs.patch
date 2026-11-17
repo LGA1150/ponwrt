@@ -1,0 +1,39 @@
+From 91f44c90d348b7f4ff2482e82db43df5ccba4674 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 10:15:46 +0800
+Subject: [PATCH] crypto: eip93 - diagnose unmatched completion IDs
+
+Remove and retrieve the completed request under the IDR lock. If the
+ID has no matching request, report the ID, descriptor flags and status
+instead of dereferencing NULL from tasklet context.
+
+This diagnostic guard cannot recover an unknown request or complete its
+caller. It complements the allocation fixes and leaves evidence for
+investigating a stale or corrupted completion.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-main.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/eip93-main.c b/eip93-main.c
+index 59b19e6..9e99a5a 100644
+--- a/eip93-main.c
++++ b/eip93-main.c
+@@ -249,9 +249,13 @@ get_more:
+ 		goto get_more;
+ 
+ 	/* Get crypto async ref only for last descriptor */
+-	scoped_guard(spinlock_bh, &eip93->ring->idr_lock) {
+-		async = idr_find(&eip93->ring->crypto_async_idr, crypto_idr);
+-		idr_remove(&eip93->ring->crypto_async_idr, crypto_idr);
++	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
++		async = idr_remove(&eip93->ring->crypto_async_idr, crypto_idr);
++	if (!async) {
++		dev_err_ratelimited(eip93->dev,
++				    "Missing request: id=%#x flags=%#x ctrl=%#x len=%#x\n",
++				    crypto_idr, desc_flags, pe_ctrl_stat, pe_length);
++		goto get_more;
+ 	}
+ 
+ 	/* Parse error in ctrl stat word */
