@@ -1,0 +1,107 @@
+From 67c2045e016fd1bf9999f68f7f0b4d5afe61b519 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 10:15:39 +0800
+Subject: [PATCH] crypto: eip93 - check cipher request ID allocation
+
+A negative idr_alloc() result was truncated into the descriptor's
+16-bit request ID. Completion could then look up an absent request and
+dereference NULL.
+
+Reserve and check the ID before preparing cipher DMA or bounce buffers,
+and release it on every failure before submission. Log allocation errors
+with rate limiting. Return ENOSPC/ENOMEM synchronously; do not claim a
+request was backlogged when it was never accepted.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-common.c | 36 ++++++++++++++++++++++++++++++------
+ eip93-common.h |  4 ++++
+ 2 files changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index b47f091..9dc4491 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -22,6 +22,28 @@
+ #include "eip93-main.h"
+ #include "eip93-regs.h"
+ 
++int eip93_alloc_req_id(struct eip93_device *eip93,
++		       struct crypto_async_request *async)
++{
++	int id;
++
++	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
++		id = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
++			       EIP93_RING_NUM - 1, GFP_ATOMIC);
++
++	if (id < 0)
++		dev_err_ratelimited(eip93->dev,
++				    "Failed to allocate request ID: %d\n", id);
++
++	return id;
++}
++
++void eip93_free_req_id(struct eip93_device *eip93, int id)
++{
++	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
++		idr_remove(&eip93->ring->crypto_async_idr, id);
++}
++
+ int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err)
+ {
+ 	u32 ext_err;
+@@ -525,11 +547,16 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	u32 split = datalen;
+ 	u32 start, end, ctr, blocks;
+ 	u32 iv[AES_BLOCK_SIZE / sizeof(u32)];
+-	int crypto_async_idr;
++	int request_id;
+ 
+ 	rctx->sa_state_ctr = NULL;
+ 	rctx->sa_state = NULL;
+ 
++	/* Reserve completion tracking before allocating or submitting anything. */
++	request_id = eip93_alloc_req_id(eip93, async);
++	if (request_id < 0)
++		return request_id;
++
+ 	err = check_valid_request(rctx, gfp);
+ 	if (err)
+ 		goto free_sg_copy;
+@@ -612,11 +639,7 @@ skip_iv:
+ 	cdesc.sa_addr = rctx->sa_record_base;
+ 	cdesc.arc4_addr = 0;
+ 
+-	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+-		crypto_async_idr = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
+-					     EIP93_RING_NUM - 1, GFP_ATOMIC);
+-
+-	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, (u16)crypto_async_idr) |
++	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, request_id) |
+ 			FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, rctx->desc_flags);
+ 
+ 	rctx->cdesc = &cdesc;
+@@ -660,6 +683,7 @@ free_sg_copy:
+ 		eip93_free_sg_copy(datalen + rctx->authsize, &rctx->sg_src);
+ 	if (rctx->sg_dst != reqdst)
+ 		eip93_free_sg_copy(datalen + rctx->authsize, &rctx->sg_dst);
++	eip93_free_req_id(eip93, request_id);
+ 
+ 	return err;
+ }
+diff --git a/eip93-common.h b/eip93-common.h
+index 80964cf..3ec63b7 100644
+--- a/eip93-common.h
++++ b/eip93-common.h
+@@ -9,6 +9,10 @@
+ #ifndef _EIP93_COMMON_H_
+ #define _EIP93_COMMON_H_
+ 
++int eip93_alloc_req_id(struct eip93_device *eip93,
++		       struct crypto_async_request *async);
++void eip93_free_req_id(struct eip93_device *eip93, int id);
++
+ void *eip93_get_descriptor(struct eip93_device *eip93);
+ int eip93_put_descriptor(struct eip93_device *eip93, struct eip93_descriptor *desc);
+ 
