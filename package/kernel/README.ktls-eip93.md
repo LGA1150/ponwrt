@@ -52,7 +52,8 @@ bytes). Release 5 added async backpressure after the device test confirmed
 `Failed to allocate request ID: -28` under the default TX benchmark. The IDR
 checks in release 4 prevented the NULL-request panic, but returned `-ENOSPC`
 to stock kTLS, which aborted transmission with `EBADMSG`.
-Release 6 adds a cache-line DMA isolation fix for the next hardware test.
+Release 7 applies cache-line isolation to DMA-written buffers for the next
+hardware test; read-only sources retain their hardware alignment checks.
 
 The EIP93 patches apply in filename order, with each fix in its own commit:
 
@@ -67,7 +68,7 @@ The EIP93 patches apply in filename order, with each fix in its own commit:
 | 007 | Prepare all hash DMA mappings before submission and safely unwind failures. |
 | 008 | Copy and acknowledge results before recycling ring slots. |
 | **009** | **Queue requests and wait for ring/request-ID credits: the backpressure fix.** |
-| **010** | **Bounce SG ranges that do not own complete DMA cache lines.** |
+| **010** | **Bounce DMA-written SG ranges that do not own complete cache lines.** |
 
 Apply the complete series through 010 for the next test. Patches
 004–008 make preparation, completion and ring reuse safe for deferred
@@ -95,22 +96,28 @@ intermittent TLS 1.2 plaintext mismatches, including both 16,384-byte and
 concrete DMA-safety problem that could explain this: word alignment and
 AES-block lengths do not prevent separate requests sharing a CPU cache line.
 Cleaning a shared line can overwrite another request's DMA output on a
-non-coherent SoC. The new check covers the full mapped SG entry, including
-bytes beyond cryptlen; private bounce mappings cover whole cache lines.
+non-coherent SoC. The new check applies to destinations and in-place
+buffers mapped `DMA_BIDIRECTIONAL`, covering the full SG entry including
+bytes beyond cryptlen. Read-only `DMA_TO_DEVICE` sources do not need this
+cache-line restriction: cleaning is non-destructive for them. Their
+existing EIP93 address and cipher-block alignment checks still apply.
+Private bounce mappings cover whole cache lines.
 
 `CONFIG_DMA_BOUNCE_UNALIGNED_KMALLOC` is enabled on this target. In Linux
 6.18.60, its `dma_kmalloc_needs_bounce()` heuristic considers size and DMA
 direction, not the pointer's alignment. It protects small destinations such
 as GCM's 16-byte mask block, but skips mappings at least
-`2 * ARCH_DMA_MINALIGN` bytes long and all `DMA_TO_DEVICE` mappings. It does
-not guarantee that a page-sized SG range at an unaligned offset is bounced.
+`2 * ARCH_DMA_MINALIGN` bytes long. Its `DMA_TO_DEVICE` exemption is
+intentional and safe for read-only sources. The size heuristic does not
+guarantee that a page-sized SG range at an unaligned offset is bounced.
 See [dma-map-ops.h](https://github.com/gregkh/linux/blob/v6.18.60/include/linux/dma-map-ops.h).
 
 This remains a candidate explanation for the reported mismatch. Host checks
 cannot establish the device's failure mechanism, and TX benchmark validation
 also exercises kTLS RX. The extra content-type byte in full TLS 1.3 records
 already sends those requests through the existing bounce path. Patch 010 may
-increase copying for block-aligned requests that previously used direct DMA.
+increase destination copying for block-aligned requests that previously
+used direct DMA.
 
 For the next hardware test, rebuild and install only `kmod-eip93`, keep stock
 kTLS, and run with console logging enabled:
@@ -269,7 +276,9 @@ hardware DMA/cache behavior.
 
 Patch 010 also passed a host test using the actual old/new alignment
 helpers: GCM request sizes, full mapped SG extents, cache-aligned fast paths,
-and bounce padding within the allocated pages. The test also uses the actual
+and bounce padding within the allocated pages. The revised checks also
+verify that read-only sources retain the old hardware alignment behavior
+while DMA-written and in-place buffers get cache-line isolation. The test also uses the actual
 `dma_kmalloc_needs_bounce()` helpers: the 16-byte destination is protected,
 but a 4,096-byte mapping at offset 16 bypasses that heuristic. A simulated
 non-coherent cache-line writeback demonstrates the unsafe large range and
@@ -277,5 +286,5 @@ how the driver bounce path isolates it. The test used AddressSanitizer and
 UBSan; it does not reproduce the physical device's failure.
 
 These checks do not produce or test a loadable Airoha module. Release 5's
-TLS 1.3 TX pass is from device testing; release 6 still needs validation.
+TLS 1.3 TX pass is from device testing; release 7 still needs validation.
 No firmware, toolchain or benchmark was rebuilt.

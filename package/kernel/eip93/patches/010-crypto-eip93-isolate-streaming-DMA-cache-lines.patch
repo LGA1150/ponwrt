@@ -1,36 +1,38 @@
-From e1f04a85f69fb7d2fe09f79b311167a3a3dbfd6b Mon Sep 17 00:00:00 2001
+From 26985d1d4afa75421b06e48aae9eecdabfa8d21e Mon Sep 17 00:00:00 2001
 From: Qingfang Deng <dqfext@gmail.com>
 Date: Tue, 17 Nov 2026 11:45:27 +0800
-Subject: [PATCH] crypto: eip93 - isolate streaming DMA cache lines
+Subject: [PATCH] crypto: eip93 - isolate DMA-written cache lines
 
 Checking word-aligned addresses and cipher-block lengths is insufficient
-for streaming DMA on a non-coherent device. Independent requests may
-share a cache line, and cleaning it for one request can overwrite data
-already written by the engine for another request. kTLS can pack records
-into adjacent page fragments.
+for buffers written by a non-coherent device. CPU writes to a neighboring
+range can dirty a shared cache line and overwrite DMA output when it is
+cleaned. kTLS can pack records into adjacent page fragments.
 
 DMA_BOUNCE_UNALIGNED_KMALLOC protects small destination mappings, including
 the generic GCM mask block. It does not check pointer alignment and skips
 mappings at least twice ARCH_DMA_MINALIGN in size. A page-sized SG entry
 at a partial cache-line offset can therefore still be mapped directly.
 
-Require cache-aligned offsets and complete SG-entry lengths before using
-the direct DMA path. Check the entire mapped entry even when cryptlen
-ends before its end. Use the existing bounce path otherwise, and round
-its private mapping up to a cache-line boundary without changing the
-number of bytes encrypted or copied back.
+Require cache-aligned offsets and complete SG-entry lengths for
+DMA-written destinations and in-place buffers. Read-only DMA_TO_DEVICE
+sources retain the existing hardware checks: cache cleaning is
+non-destructive for them. Check the entire mapped destination entry even
+when cryptlen ends before its end. Use the existing bounce path otherwise,
+and round its private mapping up to a cache-line boundary without changing
+the number of bytes encrypted or copied back.
 
-This fixes an unsafe mapping accepted by the driver. It is a candidate
-for the intermittent TLS 1.2 plaintext mismatch seen on AN7581; device
-validation is still needed to establish whether it explains that report.
+This fixes an unsafe destination mapping accepted by the driver. It is a
+candidate for the intermittent TLS 1.2 plaintext mismatch seen on AN7581;
+device validation is still needed to establish the reported failure's
+cause.
 
 Signed-off-by: Qingfang Deng <dqfext@gmail.com>
 ---
- eip93-common.c | 13 ++++++++++++-
- 1 file changed, 12 insertions(+), 1 deletion(-)
+ eip93-common.c | 26 ++++++++++++++++++++------
+ 1 file changed, 20 insertions(+), 6 deletions(-)
 
 diff --git a/eip93-common.c b/eip93-common.c
-index d23e2cf..462d1a5 100644
+index d23e2cf..07c490d 100644
 --- a/eip93-common.c
 +++ b/eip93-common.c
 @@ -196,7 +196,8 @@ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
@@ -43,9 +45,12 @@ index d23e2cf..462d1a5 100644
  
  	/* copy only as requested */
  	if (copy)
-@@ -208,12 +209,22 @@ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+@@ -206,14 +207,25 @@ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+ }
+ 
  static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
- 				const int blksize)
+-				const int blksize)
++				const int blksize, bool dma_write)
  {
 +	unsigned int dma_align = dma_get_cache_alignment();
  	int nents;
@@ -55,14 +60,43 @@ index d23e2cf..462d1a5 100644
  			return false;
  
 +		/*
-+		 * Adjacent requests must not share a streaming DMA cache line.
++		 * DMA-written buffers must not share cache lines with CPU writes.
++		 * Read-only sources only need the hardware alignment checks.
 +		 * dma_map_sg() maps the entire entry, including any bytes beyond
 +		 * the requested crypt length in the last entry.
 +		 */
-+		if (!IS_ALIGNED(sg->offset, dma_align) ||
-+		    !IS_ALIGNED(sg->length, dma_align))
++		if (dma_write && (!IS_ALIGNED(sg->offset, dma_align) ||
++				  !IS_ALIGNED(sg->length, dma_align)))
 +			return false;
 +
  		if (len <= sg->length) {
  			if (!IS_ALIGNED(len, blksize))
  				return false;
+@@ -279,21 +291,23 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 
+ 	if (authsize) {
+ 		if (dst_nents == 1 && src_nents == 1) {
+-			src_align = eip93_is_sg_aligned(src, totlen_src, blksize);
++			src_align = eip93_is_sg_aligned(src, totlen_src, blksize,
++							src == dst);
+ 			if (src ==  dst)
+ 				dst_align = src_align;
+ 			else
+-				dst_align = eip93_is_sg_aligned(dst, totlen_dst, blksize);
++				dst_align = eip93_is_sg_aligned(dst, totlen_dst,
++								blksize, true);
+ 		} else {
+ 			src_align = false;
+ 			dst_align = false;
+ 		}
+ 	} else {
+-		src_align = eip93_is_sg_aligned(src, totlen_src, blksize);
++		src_align = eip93_is_sg_aligned(src, totlen_src, blksize, src == dst);
+ 		if (src == dst)
+ 			dst_align = src_align;
+ 		else
+-			dst_align = eip93_is_sg_aligned(dst, totlen_dst, blksize);
++			dst_align = eip93_is_sg_aligned(dst, totlen_dst, blksize, true);
+ 	}
+ 
+ 	copy_len = max(totlen_src, totlen_dst);
