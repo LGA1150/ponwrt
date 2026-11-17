@@ -1,0 +1,197 @@
+From 59813a4e915fe4b4e721989477b2b845aa8614cb Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 10:40:56 +0800
+Subject: [PATCH] crypto: eip93 - reserve cipher request IDs before preparation
+
+Check ID allocation before SA mapping or bounce preparation in the
+skcipher and AEAD entry points. Pass the reserved ID to descriptor
+submission and release it on every synchronous return after reservation.
+Failed allocations return before a descriptor can be submitted or a
+callback invoked.
+
+Keep the existing DMA, bounce-buffer and allocation-flag paths intact so
+IDR handling can be tested independently.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-aead.c   | 19 ++++++++++++++++---
+ eip93-cipher.c | 19 ++++++++++++++++---
+ eip93-cipher.h |  1 +
+ eip93-common.c | 29 +++++++++++++++++++++++------
+ eip93-common.h |  4 ++++
+ 5 files changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 18dd8a9..271e7f5 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -188,14 +188,21 @@ static int eip93_aead_crypt(struct aead_request *req)
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+ 	struct crypto_async_request *async = &req->base;
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
++	struct eip93_device *eip93 = ctx->eip93;
+ 	struct crypto_aead *aead = crypto_aead_reqtfm(req);
+-	int ret;
++	int ret, request_id;
++
++	/* Reserve completion tracking before any DMA or bounce preparation. */
++	request_id = eip93_alloc_req_id(eip93, async);
++	if (request_id < 0)
++		return request_id;
++	rctx->request_id = request_id;
+ 
+ 	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
+ 					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+ 	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
+ 	if (ret)
+-		return ret;
++		goto free_request_id;
+ 
+ 	rctx->textsize = req->cryptlen;
+ 	rctx->blksize = ctx->blksize;
+@@ -210,7 +217,13 @@ static int eip93_aead_crypt(struct aead_request *req)
+ 	if (IS_DECRYPT(rctx->flags))
+ 		rctx->textsize -= rctx->authsize;
+ 
+-	return eip93_aead_send_req(async);
++	ret = eip93_aead_send_req(async);
++	if (ret == -EINPROGRESS)
++		return ret;
++
++free_request_id:
++	eip93_free_req_id(eip93, request_id);
++	return ret;
+ }
+ 
+ static int eip93_aead_encrypt(struct aead_request *req)
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index b9ea692..3f572cc 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -164,9 +164,10 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
+ 	struct crypto_async_request *async = &req->base;
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
++	struct eip93_device *eip93 = ctx->eip93;
+ 	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
+ 	bool fallback = eip93_skcipher_is_fallback(req->base.tfm, rctx->flags);
+-	int ret;
++	int ret, request_id;
+ 
+ 	if (!req->cryptlen)
+ 		return 0;
+@@ -195,11 +196,17 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 				 crypto_skcipher_decrypt(&rctx->fallback_req);
+ 	}
+ 
++	/* Reserve completion tracking before any DMA or bounce preparation. */
++	request_id = eip93_alloc_req_id(eip93, async);
++	if (request_id < 0)
++		return request_id;
++	rctx->request_id = request_id;
++
+ 	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
+ 					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+ 	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
+ 	if (ret)
+-		return ret;
++		goto free_request_id;
+ 
+ 	rctx->assoclen = 0;
+ 	rctx->textsize = req->cryptlen;
+@@ -211,7 +218,13 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 	rctx->desc_flags = EIP93_DESC_SKCIPHER;
+ 	rctx->sa_record_base = ctx->sa_record_base;
+ 
+-	return eip93_skcipher_send_req(async);
++	ret = eip93_skcipher_send_req(async);
++	if (ret == -EINPROGRESS)
++		return ret;
++
++free_request_id:
++	eip93_free_req_id(eip93, request_id);
++	return ret;
+ }
+ 
+ static int eip93_skcipher_encrypt(struct skcipher_request *req)
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index b61ff4a..b3a54e6 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -26,6 +26,7 @@ struct eip93_crypto_ctx {
+ };
+ 
+ struct eip93_cipher_reqctx {
++	int				request_id;
+ 	u16				desc_flags;
+ 	u16				flags;
+ 	unsigned int			blksize;
+diff --git a/eip93-common.c b/eip93-common.c
+index 43a2df5..1f1e551 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -22,6 +22,28 @@
+ #include "eip93-main.h"
+ #include "eip93-regs.h"
+ 
++int eip93_alloc_req_id(struct eip93_device *eip93,
++		       struct crypto_async_request *async)
++{
++	int id;
++
++	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
++		id = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
++			       EIP93_RING_NUM - 1, GFP_ATOMIC);
++
++	if (id < 0)
++		dev_err_ratelimited(eip93->dev,
++				    "Failed to allocate request ID: %d\n", id);
++
++	return id;
++}
++
++void eip93_free_req_id(struct eip93_device *eip93, int id)
++{
++	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
++		idr_remove(&eip93->ring->crypto_async_idr, id);
++}
++
+ int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err)
+ {
+ 	u32 ext_err;
+@@ -523,7 +545,6 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	u32 split = datalen;
+ 	u32 start, end, ctr, blocks;
+ 	u32 iv[AES_BLOCK_SIZE / sizeof(u32)];
+-	int crypto_async_idr;
+ 
+ 	rctx->sa_state_ctr = NULL;
+ 	rctx->sa_state = NULL;
+@@ -593,11 +614,7 @@ skip_iv:
+ 	cdesc.sa_addr = rctx->sa_record_base;
+ 	cdesc.arc4_addr = 0;
+ 
+-	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+-		crypto_async_idr = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
+-					     EIP93_RING_NUM - 1, GFP_ATOMIC);
+-
+-	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, (u16)crypto_async_idr) |
++	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, rctx->request_id) |
+ 			FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, rctx->desc_flags);
+ 
+ 	rctx->cdesc = &cdesc;
+diff --git a/eip93-common.h b/eip93-common.h
+index 80964cf..3ec63b7 100644
+--- a/eip93-common.h
++++ b/eip93-common.h
+@@ -9,6 +9,10 @@
+ #ifndef _EIP93_COMMON_H_
+ #define _EIP93_COMMON_H_
+ 
++int eip93_alloc_req_id(struct eip93_device *eip93,
++		       struct crypto_async_request *async);
++void eip93_free_req_id(struct eip93_device *eip93, int id);
++
+ void *eip93_get_descriptor(struct eip93_device *eip93);
+ int eip93_put_descriptor(struct eip93_device *eip93, struct eip93_descriptor *desc);
+ 
