@@ -52,8 +52,10 @@ bytes). Release 5 added async backpressure after the device test confirmed
 `Failed to allocate request ID: -28` under the default TX benchmark. The IDR
 checks in release 4 prevented the NULL-request panic, but returned `-ENOSPC`
 to stock kTLS, which aborted transmission with `EBADMSG`.
-Release 7 applies cache-line isolation to DMA-written buffers for the next
-hardware test; read-only sources retain their hardware alignment checks.
+Release 7 applies cache-line isolation to DMA-written buffers; read-only
+sources retain their hardware alignment checks. The default TLS 1.2 TX
+benchmark now passes on the device. Release 8 removes the algorithms'
+`cra_alignmask` initializers while retaining the driver's DMA checks.
 
 The EIP93 patches apply in filename order, with each fix in its own commit:
 
@@ -69,8 +71,9 @@ The EIP93 patches apply in filename order, with each fix in its own commit:
 | 008 | Copy and acknowledge results before recycling ring slots. |
 | **009** | **Queue requests and wait for ring/request-ID credits: the backpressure fix.** |
 | **010** | **Bounce DMA-written SG ranges that do not own complete cache lines.** |
+| 011 | Remove Crypto API alignment masks; keep the driver's DMA alignment and bounce handling. |
 
-Apply the complete series through 010 for the next test. Patches
+Apply the complete series through 011 for the next test. Patches
 004–008 make preparation, completion and ring reuse safe for deferred
 submission; they are separate so these changes can be reviewed and bisected.
 The previous IDR-only package remains available at
@@ -112,12 +115,20 @@ intentional and safe for read-only sources. The size heuristic does not
 guarantee that a page-sized SG range at an unaligned offset is bounced.
 See [dma-map-ops.h](https://github.com/gregkh/linux/blob/v6.18.60/include/linux/dma-map-ops.h).
 
-This remains a candidate explanation for the reported mismatch. Host checks
-cannot establish the device's failure mechanism, and TX benchmark validation
-also exercises kTLS RX. The extra content-type byte in full TLS 1.3 records
-already sends those requests through the existing bounce path. Patch 010 may
-increase destination copying for block-aligned requests that previously
-used direct DMA.
+The TLS 1.2 TX pass with release 7 supports this explanation for the reported
+mismatch. Repeated runs are still useful because the original failure was
+intermittent, and TX benchmark validation also exercises kTLS RX. The extra
+content-type byte in full TLS 1.3 records already sends those requests through
+the existing bounce path. Patch 010 may increase destination copying for
+block-aligned requests that previously used direct DMA.
+
+Patch 011 removes the AES skciphers' `0xf` alignment masks and the redundant
+zero initializers for the other skciphers and AEAD algorithms. The default
+mask is zero: the Crypto API no longer sees an additional caller alignment
+requirement. Keys and IVs are copied into private storage, and AES key
+expansion supports unaligned input. The driver still checks hardware address
+and block alignment and isolates DMA-written cache lines, bouncing requests
+as needed before submission.
 
 For the next hardware test, rebuild and install only `kmod-eip93`, keep stock
 kTLS, and run with console logging enabled:
@@ -278,13 +289,15 @@ Patch 010 also passed a host test using the actual old/new alignment
 helpers: GCM request sizes, full mapped SG extents, cache-aligned fast paths,
 and bounce padding within the allocated pages. The revised checks also
 verify that read-only sources retain the old hardware alignment behavior
-while DMA-written and in-place buffers get cache-line isolation. The test also uses the actual
-`dma_kmalloc_needs_bounce()` helpers: the 16-byte destination is protected,
+while DMA-written and in-place buffers get cache-line isolation. The test
+also uses the actual `dma_kmalloc_needs_bounce()` helpers: the 16-byte
+destination is protected,
 but a 4,096-byte mapping at offset 16 bypasses that heuristic. A simulated
 non-coherent cache-line writeback demonstrates the unsafe large range and
 how the driver bounce path isolates it. The test used AddressSanitizer and
 UBSan; it does not reproduce the physical device's failure.
 
 These checks do not produce or test a loadable Airoha module. Release 5's
-TLS 1.3 TX pass is from device testing; release 7 still needs validation.
+TLS 1.3 TX pass and release 7's TLS 1.2 TX pass are from device testing;
+release 8 still needs device validation.
 No firmware, toolchain or benchmark was rebuilt.
