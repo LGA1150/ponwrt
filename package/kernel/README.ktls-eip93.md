@@ -48,42 +48,64 @@ It must not be used with NIC drivers compiled against the original RX layout.
 `kmod-eip93` uses the target's existing EIP93 implementation,
 including PonWrt's small-request software fallback patch. The fallback
 configuration matches the stock package (generic: 256 bytes; AES-128: 512
-bytes). Release 4 applies only the three IDR patches for the first hardware test:
+bytes). Release 5 adds async backpressure after the device test confirmed
+`Failed to allocate request ID: -28` under the default TX benchmark. The IDR
+checks in release 4 prevented the NULL-request panic, but returned `-ENOSPC`
+to stock kTLS, which aborted transmission with `EBADMSG`.
 
-1. Reserve and check cipher request IDs before DMA or bounce preparation,
-   and release the ID when the request returns synchronously.
-2. Reserve hash request IDs before submitting any intermediate blocks,
-   and release the ID when no asynchronous completion will follow.
-3. Log unmatched completion IDs and skip the NULL request.
+The EIP93 patches apply in filename order, with each fix in its own commit:
 
-Apply the series in filename order. Patch 002 uses the checked ID allocator
-from 001. The cipher fix is independent of the broader cleanup and DMA fixes.
-Failed ID allocations return before hardware submission or a callback.
-Existing DMA mapping, bounce-buffer cleanup, allocation flags and hash
-descriptor-publication behavior are retained to isolate IDR handling.
-The broader seven-patch series remains available in
-[revision 6122d6e](https://github.com/LGA1150/ponwrt/tree/6122d6e4d427a6220bed0668d016ca4864588561/package/kernel/eip93/patches)
-for later testing.
+| Patch | Change |
+| --- | --- |
+| 001 | Reserve and check cipher request IDs before preparation. |
+| 002 | Reserve hash request IDs before submitting intermediate blocks. |
+| 003 | Diagnose unmatched completion IDs without dereferencing NULL. |
+| 004 | Unwind cipher preparation failures without a second completion or copying uninitialized output. |
+| 005 | Keep cipher direction and AAD controls in a private SA for each request. |
+| 006 | Map cipher IV state bidirectionally, including CTR wrap state. |
+| 007 | Prepare all hash DMA mappings before submission and safely unwind failures. |
+| 008 | Copy and acknowledge results before recycling ring slots. |
+| **009** | **Queue requests and wait for ring/request-ID credits: the backpressure fix.** |
 
-This series rejects ID exhaustion with `-ENOSPC` and IDR allocation failure with
-`-ENOMEM`. It does not add a software backlog or replace the descriptor-ring
-retry loop. If `Missing request:` still appears, retain its ID, flags and status
-words: the driver cannot recover the original request from an unmatched ID,
-and its caller may remain waiting. The observed crash established a NULL
-request lookup; ID exhaustion has not yet been confirmed on hardware.
+Apply the complete series through 009 for the backpressure test. Patches
+004–008 make preparation, completion and ring reuse safe for deferred
+submission; they are separate so these changes can be reviewed and bisected.
+The previous IDR-only package remains available at
+[revision f600a23](https://github.com/LGA1150/ponwrt/tree/f600a2304d24ad8e8f403c10789a8d107cac9e6f/package/kernel/eip93).
+
+The worker handles skcipher, AEAD and hash requests because they share the
+same hardware resources. It keeps multiple requests in flight, up to the
+existing 511 request IDs and 511 usable descriptor slots. When either limit
+is reached it sleeps until completion returns a credit. Large requests can
+span multiple ring passes. Submission no longer uses a timed retry loop.
+
+The software queue admits 511 pending requests before using the Crypto API
+backlog contract: an accepted backlog request returns `-EBUSY`, receives an
+`-EINPROGRESS` callback when promoted, and later receives its final completion.
+Stock kTLS permits backlog and waits for that notification. Callers without
+`CRYPTO_TFM_REQ_MAY_BACKLOG` can still receive `-ENOSPC` if the software queue
+is full. Allocation and DMA failures remain errors; preparation failures
+complete an accepted request exactly once.
+
+For the next hardware test, rebuild and install only `kmod-eip93`, keep stock
+kTLS, and run with console logging enabled:
+
+```sh
+./tls_rx_bench -d tx
+./tls_rx_bench -d tx -m splice
+./tls_rx_bench -d rx
+```
+
+The original `Failed to allocate request ID: -28` should no longer occur
+under ordinary load. Retain `Failed to allocate request ID: -12` or
+`Missing request: ...` messages if they appear. An unmatched completion
+still cannot identify or complete its original waiting request; its ID,
+flags, control and length words are needed for diagnosis.
+
 Add further driver experiments under `package/kernel/eip93/patches/`.
-It supports the same Airoha and MT7621 targets as the stock EIP93 package.
+The package supports the same Airoha and MT7621 targets as the stock driver.
 AN7581 and AN7583 already have enabled EIP93 device-tree nodes in this fork.
 Other boards still need a suitable enabled device-tree node.
-
-For this first test, rebuild and install only `kmod-eip93`, keep stock kTLS,
-and rerun `./tls_rx_bench -d tx` with console logging enabled. Retain these
-rate-limited messages if they appear:
-
-- `Failed to allocate request ID: -28`: the IDR has no free request IDs.
-- `Failed to allocate request ID: -12`: allocation failed with `-ENOMEM`.
-- `Missing request: ...`: a completion ID has no matching tracked request;
-  retain its ID, flags, control and length words for further diagnosis.
 
 ## Select the packages
 
@@ -200,10 +222,24 @@ Run both TLS versions and both directions, including splice, and retain
 plaintext verification when comparing results. Cipher selection also applies
 to preparation, every worker and the untimed verification pass.
 
-The initial package validation used source/patch and package metadata checks.
-Each intermediate version of the three-patch IDR series was compiled with
-host GCC 14.2 and `W=1` against prepared Linux 6.18 x86-64 headers, including
-PonWrt's fallback
-patch and settings. All five driver objects compiled and linked into
-`crypto-hw-eip93.o`; this is a host compile check, not a loadable Airoha module
-or a hardware runtime test. No firmware, toolchain or benchmark was rebuilt.
+The package and each intermediate EIP93 patch version were checked with host
+GCC 14.2 and `W=1` against prepared Linux 6.18 x86-64 headers, including
+PonWrt's fallback patch and settings. The final six driver objects compiled
+and linked into `crypto-hw-eip93.o`. All package patches apply to the prepared
+Linux 6.18.60 driver without fuzz or offsets and reproduce the compiled
+sources. Strict checkpatch passes, apart from the generic new-file advisory
+for `eip93-queue.c`, which is already covered by the upstream EIP93
+MAINTAINERS directory entry.
+
+A host harness compiled the actual queue, ID and ring functions with mocked
+kernel primitives and DMA, using AddressSanitizer and UBSan. It exercised
+511 occupied IDs, queue overflow and backlog notifications, requests larger
+than two rings, 4,096 requests from concurrent producers, injected allocation
+and preparation failures, immediate request freeing, and shutdown with work
+pending. Every accepted request completed exactly once and all credits were
+returned. This tests the submission lifecycle, not cryptographic output or
+hardware DMA/cache behavior.
+
+These checks do not produce or test a loadable Airoha module. The new
+backpressure series still needs device testing. No firmware, toolchain or
+benchmark was rebuilt.
