@@ -98,6 +98,14 @@ Cleaning a shared line can overwrite another request's DMA output on a
 non-coherent SoC. The new check covers the full mapped SG entry, including
 bytes beyond cryptlen; private bounce mappings cover whole cache lines.
 
+`CONFIG_DMA_BOUNCE_UNALIGNED_KMALLOC` is enabled on this target. In Linux
+6.18.60, its `dma_kmalloc_needs_bounce()` heuristic considers size and DMA
+direction, not the pointer's alignment. It protects small destinations such
+as GCM's 16-byte mask block, but skips mappings at least
+`2 * ARCH_DMA_MINALIGN` bytes long and all `DMA_TO_DEVICE` mappings. It does
+not guarantee that a page-sized SG range at an unaligned offset is bounced.
+See [dma-map-ops.h](https://github.com/gregkh/linux/blob/v6.18.60/include/linux/dma-map-ops.h).
+
 This remains a candidate explanation for the reported mismatch. Host checks
 cannot establish the device's failure mechanism, and TX benchmark validation
 also exercises kTLS RX. The extra content-type byte in full TLS 1.3 records
@@ -261,10 +269,12 @@ hardware DMA/cache behavior.
 
 Patch 010 also passed a host test using the actual old/new alignment
 helpers: GCM request sizes, full mapped SG extents, cache-aligned fast paths,
-and bounce padding within the allocated pages. A simulated non-coherent
-cache-line writeback demonstrates why the old accepted range is unsafe and
-how the bounce path isolates it. The test used AddressSanitizer and UBSan;
-it does not reproduce the physical device's failure.
+and bounce padding within the allocated pages. The test also uses the actual
+`dma_kmalloc_needs_bounce()` helpers: the 16-byte destination is protected,
+but a 4,096-byte mapping at offset 16 bypasses that heuristic. A simulated
+non-coherent cache-line writeback demonstrates the unsafe large range and
+how the driver bounce path isolates it. The test used AddressSanitizer and
+UBSan; it does not reproduce the physical device's failure.
 
 These checks do not produce or test a loadable Airoha module. Release 5's
 TLS 1.3 TX pass is from device testing; release 6 still needs validation.

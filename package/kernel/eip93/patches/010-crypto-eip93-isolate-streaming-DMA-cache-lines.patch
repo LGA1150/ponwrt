@@ -1,4 +1,4 @@
-From 3354926c688ebb91fff4280594c46fb6a72809d8 Mon Sep 17 00:00:00 2001
+From e1f04a85f69fb7d2fe09f79b311167a3a3dbfd6b Mon Sep 17 00:00:00 2001
 From: Qingfang Deng <dqfext@gmail.com>
 Date: Tue, 17 Nov 2026 11:45:27 +0800
 Subject: [PATCH] crypto: eip93 - isolate streaming DMA cache lines
@@ -7,8 +7,12 @@ Checking word-aligned addresses and cipher-block lengths is insufficient
 for streaming DMA on a non-coherent device. Independent requests may
 share a cache line, and cleaning it for one request can overwrite data
 already written by the engine for another request. kTLS can pack records
-into adjacent page fragments, and generic GCM also supplies a 16-byte
-mask block from its request context.
+into adjacent page fragments.
+
+DMA_BOUNCE_UNALIGNED_KMALLOC protects small destination mappings, including
+the generic GCM mask block. It does not check pointer alignment and skips
+mappings at least twice ARCH_DMA_MINALIGN in size. A page-sized SG entry
+at a partial cache-line offset can therefore still be mapped directly.
 
 Require cache-aligned offsets and complete SG-entry lengths before using
 the direct DMA path. Check the entire mapped entry even when cryptlen
