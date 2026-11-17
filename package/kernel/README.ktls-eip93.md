@@ -48,10 +48,11 @@ It must not be used with NIC drivers compiled against the original RX layout.
 `kmod-eip93` uses the target's existing EIP93 implementation,
 including PonWrt's small-request software fallback patch. The fallback
 configuration matches the stock package (generic: 256 bytes; AES-128: 512
-bytes). Release 5 adds async backpressure after the device test confirmed
+bytes). Release 5 added async backpressure after the device test confirmed
 `Failed to allocate request ID: -28` under the default TX benchmark. The IDR
 checks in release 4 prevented the NULL-request panic, but returned `-ENOSPC`
 to stock kTLS, which aborted transmission with `EBADMSG`.
+Release 6 adds a cache-line DMA isolation fix for the next hardware test.
 
 The EIP93 patches apply in filename order, with each fix in its own commit:
 
@@ -66,8 +67,9 @@ The EIP93 patches apply in filename order, with each fix in its own commit:
 | 007 | Prepare all hash DMA mappings before submission and safely unwind failures. |
 | 008 | Copy and acknowledge results before recycling ring slots. |
 | **009** | **Queue requests and wait for ring/request-ID credits: the backpressure fix.** |
+| **010** | **Bounce SG ranges that do not own complete DMA cache lines.** |
 
-Apply the complete series through 009 for the backpressure test. Patches
+Apply the complete series through 010 for the next test. Patches
 004–008 make preparation, completion and ring reuse safe for deferred
 submission; they are separate so these changes can be reviewed and bisected.
 The previous IDR-only package remains available at
@@ -87,13 +89,30 @@ Stock kTLS permits backlog and waits for that notification. Callers without
 is full. Allocation and DMA failures remain errors; preparation failures
 complete an accepted request exactly once.
 
+Device testing of release 5 passed default TLS 1.3 TX but reported
+intermittent TLS 1.2 plaintext mismatches, including both 16,384-byte and
+16,368-byte records. The failing record number varied. Patch 010 fixes a
+concrete DMA-safety problem that could explain this: word alignment and
+AES-block lengths do not prevent separate requests sharing a CPU cache line.
+Cleaning a shared line can overwrite another request's DMA output on a
+non-coherent SoC. The new check covers the full mapped SG entry, including
+bytes beyond cryptlen; private bounce mappings cover whole cache lines.
+
+This remains a candidate explanation for the reported mismatch. Host checks
+cannot establish the device's failure mechanism, and TX benchmark validation
+also exercises kTLS RX. The extra content-type byte in full TLS 1.3 records
+already sends those requests through the existing bounce path. Patch 010 may
+increase copying for block-aligned requests that previously used direct DMA.
+
 For the next hardware test, rebuild and install only `kmod-eip93`, keep stock
 kTLS, and run with console logging enabled:
 
 ```sh
-./tls_rx_bench -d tx
-./tls_rx_bench -d tx -m splice
-./tls_rx_bench -d rx
+./tls_rx_bench -d tx -v 1.2
+./tls_rx_bench -d tx -v 1.2 -s 16368
+./tls_rx_bench -d tx -v 1.3
+./tls_rx_bench -d tx -v 1.2 -m splice
+./tls_rx_bench -d rx -v 1.2
 ```
 
 The original `Failed to allocate request ID: -28` should no longer occur
@@ -240,6 +259,13 @@ pending. Every accepted request completed exactly once and all credits were
 returned. This tests the submission lifecycle, not cryptographic output or
 hardware DMA/cache behavior.
 
-These checks do not produce or test a loadable Airoha module. The new
-backpressure series still needs device testing. No firmware, toolchain or
-benchmark was rebuilt.
+Patch 010 also passed a host test using the actual old/new alignment
+helpers: GCM request sizes, full mapped SG extents, cache-aligned fast paths,
+and bounce padding within the allocated pages. A simulated non-coherent
+cache-line writeback demonstrates why the old accepted range is unsafe and
+how the bounce path isolates it. The test used AddressSanitizer and UBSan;
+it does not reproduce the physical device's failure.
+
+These checks do not produce or test a loadable Airoha module. Release 5's
+TLS 1.3 TX pass is from device testing; release 6 still needs validation.
+No firmware, toolchain or benchmark was rebuilt.
