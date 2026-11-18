@@ -1,0 +1,44 @@
+From 00b5a4520792420d089c23dc73d9025d20a05059 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 01:32:03 +0800
+Subject: [PATCH] crypto: eip93 - remove the four-byte SG offset restriction
+
+Allow byte-aligned SG starts instead of bouncing a request solely because
+an entry starts at an offset that is not a multiple of four. This permits
+read-only sources to use direct DMA when their lengths and SG layout meet
+the remaining requirements.
+
+An earlier attempt caused TLS 1.2 RX corruption on Airoha with the old
+DMA thresholds. Apply this change after lowering both thresholds to 64
+bytes and restoring native authenc packet-tag DMA. The full device test
+matrix passed with those changes, but retained the SG offset check; that
+result does not yet validate byte-aligned source DMA on hardware.
+
+Keep cache-line isolation for DMA-written destinations and in-place
+buffers, as well as cipher-block length and SG boundary checks.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-common.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index 8850fc3..8c42282 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -262,12 +262,8 @@ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+ 	int nents;
+ 
+ 	for (nents = 0; sg; sg = sg_next(sg), ++nents) {
+-		if (!IS_ALIGNED(sg->offset, 4))
+-			return false;
+-
+ 		/*
+ 		 * DMA-written buffers must not share cache lines with CPU writes.
+-		 * Read-only sources only need the hardware alignment checks.
+ 		 * dma_map_sg() maps the entire entry, including any bytes beyond
+ 		 * the requested crypt length in the last entry.
+ 		 */
+-- 
+2.52.0
+

@@ -1,0 +1,99 @@
+From 2bf0c9b199de60bf6638bbf564fb90666034f4d8 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 20:27:01 +0800
+Subject: [PATCH] crypto: eip93 - allow a probe-time DMA burst field override
+
+Investigating the intermittent Airoha authenc tail corruption requires
+holding buffer placement and message parameters constant while varying
+MXBRSTSZ. Add a read-only module parameter which applies at probe before
+requests can reach the engine, and log the before/after register values.
+
+Accept raw four-bit field values, preserving all other DMA configuration
+bits. The default -1 leaves the hardware setting unchanged. Read back
+the result and diagnose an override that did not stick. Runtime changes
+are deliberately unavailable so this cannot reconfigure an active DMA
+transfer through sysfs.
+
+The SHARC+ reference documents the register at offset 0x120 in table
+A-105 and MXBRSTSZ in table 44-43. Use raw field encodings rather than
+assuming a conversion to byte counts on the Airoha integration.
+
+Host GCC W=1 builds the module. QEMU checks the actual parameter parsing
+and register update helper against mocked registers, including default
+preservation, range rejection, read-only sysfs and untouched other bits.
+Physical burst behavior must be tested on the device.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-main.c | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/eip93-main.c b/eip93-main.c
+index a46ce8a..a8e9632 100644
+--- a/eip93-main.c
++++ b/eip93-main.c
+@@ -27,6 +27,30 @@
+ #include "eip93-aead.h"
+ #include "eip93-hash.h"
+ 
++static int dma_maxburst = -1;
++
++static int eip93_maxburst_set(const char *val, const struct kernel_param *kp)
++{
++	int burst, err;
++
++	err = kstrtoint(val, 0, &burst);
++	if (err)
++		return err;
++	if (burst < -1 || burst > (int)FIELD_MAX(EIP93_PE_DMA_MAX_BURST))
++		return -EINVAL;
++
++	*(int *)kp->arg = burst;
++	return 0;
++}
++
++static const struct kernel_param_ops eip93_maxburst_ops = {
++	.set = eip93_maxburst_set,
++	.get = param_get_int,
++};
++
++module_param_cb(dma_maxburst, &eip93_maxburst_ops, &dma_maxburst, 0444);
++MODULE_PARM_DESC(dma_maxburst, "Diagnostic MXBRSTSZ raw field override, 0..15; -1 preserves hardware setting");
++
+ static struct eip93_alg_template *eip93_algs[] = {
+ 	&eip93_alg_ecb_des,
+ 	&eip93_alg_cbc_des,
+@@ -292,6 +316,24 @@ static irqreturn_t eip93_irq_handler(int irq, void *data)
+ 	return IRQ_NONE;
+ }
+ 
++static void eip93_configure_dma(struct eip93_device *eip93)
++{
++	u32 before = readl(eip93->base + EIP93_REG_PE_DMA_CONFIG);
++	u32 after = before;
++
++	/* Apply only at probe, before any requests can reach the engine. */
++	if (dma_maxburst >= 0) {
++		after &= ~EIP93_PE_DMA_MAX_BURST;
++		after |= FIELD_PREP(EIP93_PE_DMA_MAX_BURST, dma_maxburst);
++		writel(after, eip93->base + EIP93_REG_PE_DMA_CONFIG);
++		after = readl(eip93->base + EIP93_REG_PE_DMA_CONFIG);
++		if (FIELD_GET(EIP93_PE_DMA_MAX_BURST, after) != dma_maxburst)
++			dev_warn(eip93->dev, "MXBRSTSZ override did not stick\n");
++	}
++	dev_info(eip93->dev, "DMA config: %#010x -> %#010x (MXBRSTSZ=%u, requested=%d)\n",
++		 before, after, (u32)FIELD_GET(EIP93_PE_DMA_MAX_BURST, after), dma_maxburst);
++}
++
+ static void eip93_initialize(struct eip93_device *eip93, u32 supported_algo_flags)
+ {
+ 	u32 val;
+@@ -323,6 +365,8 @@ static void eip93_initialize(struct eip93_device *eip93, u32 supported_algo_flag
+ 		val |= EIP93_PE_CLOCK_EN_HASH_CLK;
+ 	writel(val, eip93->base + EIP93_REG_PE_CLOCK_CTRL);
+ 
++	eip93_configure_dma(eip93);
++
+ 	/* Config DMA thresholds */
+ 	val = FIELD_PREP(EIP93_PE_OUTBUF_THRESH, 128) |
+ 	      FIELD_PREP(EIP93_PE_INBUF_THRESH, 128);

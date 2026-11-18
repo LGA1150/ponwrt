@@ -1,0 +1,62 @@
+From 4c18a652d461fea9316c2a50e2389158106c1409 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 10:27:53 +0800
+Subject: [PATCH] crypto: eip93 - disable size-based AES fallback by default
+
+The distribution's small-request AES fallback masks hardware coverage
+through 512 bytes for AES-128 and 256 bytes for AES-192/256. Add a
+module-local switch, disabled by default, so valid nonempty requests use
+the hardware queue regardless of the prepared kernel's fallback thresholds.
+
+Make the switch load-time only because transform initialization uses it
+to allocate the fallback and size request contexts. With it disabled,
+initialization, setkey and submission all skip the software transform.
+An explicit aes_sw_fallback=1 restores the configured size thresholds for
+comparisons without rebuilding the base kernel.
+
+Zero-length skcipher requests remain no-ops and malformed block lengths
+still fail validation. Preserve the independent authenc fallbacks for
+empty payloads and AAD offsets the hardware cannot represent.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-cipher.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index d57f225..2fb2b8c 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -10,6 +10,7 @@
+ #include <crypto/ctr.h>
+ #include <crypto/internal/des.h>
+ #include <linux/dma-mapping.h>
++#include <linux/moduleparam.h>
+ 
+ #include "eip93-aes.h"
+ #include "eip93-cipher.h"
+@@ -17,6 +18,11 @@
+ #include "eip93-des.h"
+ #include "eip93-regs.h"
+ 
++/* Load-time only: fallback allocation and request sizing depend on it. */
++static bool aes_sw_fallback;
++module_param(aes_sw_fallback, bool, 0444);
++MODULE_PARM_DESC(aes_sw_fallback, "Enable size-based AES software fallback (default off)");
++
+ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
+@@ -33,7 +39,8 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
+ static inline bool eip93_skcipher_is_fallback(const struct crypto_tfm *tfm,
+ 					      u32 flags)
+ {
+-	return (tfm->__crt_alg->cra_flags & CRYPTO_ALG_NEED_FALLBACK) &&
++	return aes_sw_fallback &&
++		(tfm->__crt_alg->cra_flags & CRYPTO_ALG_NEED_FALLBACK) &&
+ 		!IS_RFC3686(flags);
+ }
+ 
+-- 
+2.52.0
+

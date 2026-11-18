@@ -1,0 +1,159 @@
+From 4e5426c506b9c0b9169cf9a344d61d7a603217c0 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 17:25:14 +0800
+Subject: [PATCH] crypto: eip93 - handle empty authenc payloads without cipher
+ DMA
+
+Encrypting an authenc message with no plaintext or associated data is a
+valid request to generate an HMAC tag. check_valid_request() calculates
+zero source entries for it, but eip93_send_req() still calls dma_map_sg().
+The DMA layer warns about the unexpected zero mapping result and the
+driver incorrectly reports ENOMEM. Tag-only decryption has the analogous
+zero-length destination problem.
+
+Use a synchronous authenc fallback when there is no cipher payload,
+including requests which authenticate associated data only. Excluding
+CRYPTO_ALG_ASYNC prevents recursion into EIP93 and lets these operations
+complete without queueing or DMA. Keep the fallback key and authentication
+size synchronized and reserve enough request context for either path.
+Retain the existing hardware tag-size validation and unwind the fallback
+when initialization fails.
+
+Host GCC 14.2 W=1 builds the complete module. A QEMU test of the actual
+AEAD front end, with cipher submission rejected by a stub and hardware
+HMAC pad preparation mocked, reproduces the old empty-input submission
+and passes 352 empty-payload cases after the fix without submitting to
+the cipher queue. It covers all sixteen authenc algorithms,
+key sizes, SG layouts, AAD, truncated tags and authentication failures.
+Physical EIP93 validation remains necessary.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-aead.c   | 46 ++++++++++++++++++++++++++++++++++++++++++++--
+ eip93-cipher.h |  1 +
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 4a59eac..7c700eb 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -47,16 +47,25 @@ static int eip93_aead_cra_init(struct crypto_tfm *tfm)
+ 	struct eip93_alg_template *tmpl = container_of(tfm->__crt_alg,
+ 				struct eip93_alg_template, alg.aead.base);
+ 
++	/* Empty payloads need authentication but must not reach cipher DMA. */
++	ctx->aead_fallback = crypto_alloc_aead(crypto_tfm_alg_name(tfm), 0,
++					       CRYPTO_ALG_ASYNC);
++	if (IS_ERR(ctx->aead_fallback))
++		return PTR_ERR(ctx->aead_fallback);
++
+ 	crypto_aead_set_reqsize(__crypto_aead_cast(tfm),
+-				sizeof(struct eip93_cipher_reqctx));
++		max_t(unsigned int, sizeof(struct eip93_cipher_reqctx),
++		      sizeof(struct aead_request) + crypto_aead_reqsize(ctx->aead_fallback)));
+ 
+ 	ctx->eip93 = tmpl->eip93;
+ 	ctx->flags = tmpl->flags;
+ 	ctx->type = tmpl->type;
+ 
+ 	ctx->sa_record = kzalloc(sizeof(*ctx->sa_record), GFP_KERNEL);
+-	if (!ctx->sa_record)
++	if (!ctx->sa_record) {
++		crypto_free_aead(ctx->aead_fallback);
+ 		return -ENOMEM;
++	}
+ 
+ 	return 0;
+ }
+@@ -66,6 +75,7 @@ static void eip93_aead_cra_exit(struct crypto_tfm *tfm)
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+ 	kfree(ctx->sa_record);
++	crypto_free_aead(ctx->aead_fallback);
+ }
+ 
+ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+@@ -79,6 +89,13 @@ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+ 	u32 nonce = 0;
+ 	int ret;
+ 
++	crypto_aead_clear_flags(ctx->aead_fallback, CRYPTO_TFM_REQ_MASK);
++	crypto_aead_set_flags(ctx->aead_fallback,
++			      crypto_aead_get_flags(ctfm) & CRYPTO_TFM_REQ_MASK);
++	ret = crypto_aead_setkey(ctx->aead_fallback, key, len);
++	if (ret)
++		return ret;
++
+ 	if (crypto_authenc_extractkeys(&keys, key, len))
+ 		return -EINVAL;
+ 
+@@ -143,10 +160,15 @@ static int eip93_aead_setauthsize(struct crypto_aead *ctfm,
+ {
+ 	struct crypto_tfm *tfm = crypto_aead_tfm(ctfm);
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
++	int err;
+ 
+ 	if (!IS_ALIGNED(authsize, sizeof(u32)))
+ 		return -EINVAL;
+ 
++	err = crypto_aead_setauthsize(ctx->aead_fallback, authsize);
++	if (err)
++		return err;
++
+ 	ctx->authsize = authsize;
+ 	ctx->sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_DIGEST_LENGTH;
+ 	ctx->sa_record->sa_cmd0_word |= FIELD_PREP(EIP93_SA_CMD_DIGEST_LENGTH,
+@@ -190,11 +212,28 @@ int eip93_aead_submit(struct crypto_async_request *async)
+ 	return ret;
+ }
+ 
++static int eip93_aead_fallback(struct aead_request *req, bool encrypt)
++{
++	struct eip93_crypto_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
++	struct aead_request *subreq = aead_request_ctx(req);
++
++	aead_request_set_tfm(subreq, ctx->aead_fallback);
++	/* The fallback is synchronous, even if the caller permits backlog. */
++	aead_request_set_callback(subreq, req->base.flags, NULL, NULL);
++	aead_request_set_crypt(subreq, req->src, req->dst, req->cryptlen, req->iv);
++	aead_request_set_ad(subreq, req->assoclen);
++
++	return encrypt ? crypto_aead_encrypt(subreq) : crypto_aead_decrypt(subreq);
++}
++
+ static int eip93_aead_encrypt(struct aead_request *req)
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+ 
++	if (!req->cryptlen)
++		return eip93_aead_fallback(req, true);
++
+ 	rctx->flags = ctx->flags;
+ 	rctx->flags |= EIP93_ENCRYPT;
+ 
+@@ -206,6 +245,9 @@ static int eip93_aead_decrypt(struct aead_request *req)
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+ 
++	if (req->cryptlen == crypto_aead_authsize(crypto_aead_reqtfm(req)))
++		return eip93_aead_fallback(req, false);
++
+ 	rctx->flags = ctx->flags;
+ 	rctx->flags |= EIP93_DECRYPT;
+ 
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index 36e3fc0..01a246f 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -19,6 +19,7 @@ struct eip93_crypto_ctx {
+ 	unsigned int			keylen;
+ 	/* AEAD specific */
+ 	unsigned int			authsize;
++	struct crypto_aead		*aead_fallback;
+ 	enum eip93_alg_type		type;
+ 	struct crypto_skcipher		*fallback;
+ };
+-- 
+2.52.0
+

@@ -1,0 +1,41 @@
+From 7c089fad0e66e4e56e439fcfa598e9ab4c035efe Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 01:08:27 +0800
+Subject: [PATCH] crypto: eip93 - lower DMA buffer thresholds to 64 bytes
+
+The default 128-byte output threshold can intermittently corrupt the
+final partial word of authenc plaintext on Airoha EN7581, even after
+successful authentication. Output thresholds below 128 avoid the observed
+failure, while lowering only the input threshold does not. Reducing the
+DMA maximum burst setting also avoids the failure but costs throughput.
+
+Program 64-byte input and output thresholds for all EIP93 devices. This
+writes 0x00400040 to PE_BUF_THRESH and keeps the output threshold below
+the observed failure boundary. Device throughput measurements did not
+change across output thresholds of 32, 64, 96 and 124.
+
+Retain the existing DMA burst setting, alignment checks and authenc
+fallbacks. This does not establish that unaligned source DMA is reliable.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-main.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/eip93-main.c b/eip93-main.c
+index a8e9632..b5d9846 100644
+--- a/eip93-main.c
++++ b/eip93-main.c
+@@ -367,9 +367,9 @@ static void eip93_initialize(struct eip93_device *eip93, u32 supported_algo_flag
+ 
+ 	eip93_configure_dma(eip93);
+ 
+-	/* Config DMA thresholds */
+-	val = FIELD_PREP(EIP93_PE_OUTBUF_THRESH, 128) |
+-	      FIELD_PREP(EIP93_PE_INBUF_THRESH, 128);
++	/* Keep DMA thresholds below the size that corrupts Airoha output tails. */
++	val = FIELD_PREP(EIP93_PE_OUTBUF_THRESH, 64) |
++	      FIELD_PREP(EIP93_PE_INBUF_THRESH, 64);
+ 	writel(val, eip93->base + EIP93_REG_PE_BUF_THRESH);
+ 
+ 	/* Clear/ack all interrupts before disable all */

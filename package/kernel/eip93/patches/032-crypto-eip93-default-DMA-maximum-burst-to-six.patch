@@ -1,0 +1,44 @@
+From 7980989b605baaef66d386ccf7aca25ff24340f8 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 10:12:11 +0800
+Subject: [PATCH] crypto: eip93 - default the DMA maximum burst field to 6
+
+Use raw MXBRSTSZ 6 for normal operation. Raw 5 reduced throughput and did
+not prevent the short unaligned authenc corruption, so it cannot replace
+the source-buffer safeguards. The register may retain a previous override
+across driver reloads; program the selected normal setting at probe.
+
+Keep the explicit 0..15 overrides and -1 preservation mode. The existing
+read-modify-write helper changes only the maximum burst field, before
+algorithms are registered. Both buffer thresholds remain 64 bytes.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-main.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/eip93-main.c b/eip93-main.c
+index b11dc25..8ef4b22 100644
+--- a/eip93-main.c
++++ b/eip93-main.c
+@@ -27,7 +27,7 @@
+ #include "eip93-aead.h"
+ #include "eip93-hash.h"
+ 
+-static int dma_maxburst = -1;
++static int dma_maxburst = 6;
+ 
+ static int eip93_maxburst_set(const char *val, const struct kernel_param *kp)
+ {
+@@ -49,7 +49,7 @@ static const struct kernel_param_ops eip93_maxburst_ops = {
+ };
+ 
+ module_param_cb(dma_maxburst, &eip93_maxburst_ops, &dma_maxburst, 0444);
+-MODULE_PARM_DESC(dma_maxburst, "Diagnostic MXBRSTSZ raw field override, 0..15; -1 preserves hardware setting");
++MODULE_PARM_DESC(dma_maxburst, "MXBRSTSZ raw field, 0..15 (default 6); -1 preserves hardware setting");
+ 
+ static struct eip93_alg_template *eip93_algs[] = {
+ 	&eip93_alg_ecb_des,
+-- 
+2.52.0
+

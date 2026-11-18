@@ -1,0 +1,173 @@
+From 8438987ddb0c0483a7a1185ea7422fc343cd927c Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 02:04:18 +0800
+Subject: [PATCH] crypto: eip93 - add skcipher source alignment diagnostics
+
+The byte-offset ECB-DES replay can corrupt its final block even with
+64-byte input and output thresholds. Add a disabled-by-default source
+alignment bypass for controlled skcipher experiments. It applies only
+to requests with distinct source and destination SG tables; destination
+and in-place alignment checks, block lengths and authenc are unchanged.
+
+Add independent, disabled-by-default skcipher DMA logging. Report mapping
+addresses and lengths, bounce decisions, raw DMA configuration and buffer
+thresholds, every submitted descriptor and the final completion status.
+No keys or payload bytes are logged by the driver.
+
+Both parameters can be changed through root-only sysfs controls. Keep
+the normal source bounce behavior unless the diagnostic bypass is
+explicitly enabled; unaligned source DMA is known to corrupt data.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-common.c | 41 ++++++++++++++++++++++++++++++++++-------
+ eip93-common.h |  1 +
+ eip93-main.c   |  5 +++++
+ 3 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index 8850fc3..bf4d8e1 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -33,6 +33,14 @@ bool eip93_aead_dma_debug;
+ module_param_named(aead_dma_debug, eip93_aead_dma_debug, bool, 0600);
+ MODULE_PARM_DESC(aead_dma_debug, "Log authenc DMA addresses, lengths and all completions");
+ 
++bool eip93_skcipher_dma_debug;
++module_param_named(skcipher_dma_debug, eip93_skcipher_dma_debug, bool, 0600);
++MODULE_PARM_DESC(skcipher_dma_debug, "Log skcipher DMA mappings, descriptors and completions");
++
++static bool skcipher_unaligned_src;
++module_param(skcipher_unaligned_src, bool, 0600);
++MODULE_PARM_DESC(skcipher_unaligned_src, "Diagnostic: allow unaligned read-only skcipher sources (known to corrupt data)");
++
+ static unsigned int aead_src_offset;
+ static unsigned int aead_dst_offset;
+ 
+@@ -256,18 +264,19 @@ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+ }
+ 
+ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+-				const int blksize, bool dma_write)
++				const int blksize, bool dma_write,
++				bool allow_unaligned)
+ {
+ 	unsigned int dma_align = dma_get_cache_alignment();
+ 	int nents;
+ 
+ 	for (nents = 0; sg; sg = sg_next(sg), ++nents) {
+-		if (!IS_ALIGNED(sg->offset, 4))
++		if (!IS_ALIGNED(sg->offset, 4) && (dma_write || !allow_unaligned))
+ 			return false;
+ 
+ 		/*
+ 		 * DMA-written buffers must not share cache lines with CPU writes.
+-		 * Read-only sources only need the hardware alignment checks.
++		 * The diagnostic bypass applies only to read-only source offsets.
+ 		 * dma_map_sg() maps the entire entry, including any bytes beyond
+ 		 * the requested crypt length in the last entry.
+ 		 */
+@@ -302,6 +311,8 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	u32 copy_len;
+ 	unsigned int src_offset = 0, dst_offset = 0;
+ 	bool src_align, dst_align;
++	bool allow_unaligned = !authsize && src != dst &&
++			       READ_ONCE(skcipher_unaligned_src);
+ 	int src_nents, dst_nents;
+ 	int err = -EINVAL;
+ 
+@@ -342,22 +353,23 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	if (authsize) {
+ 		if (dst_nents == 1 && src_nents == 1) {
+ 			src_align = eip93_is_sg_aligned(src, totlen_src, blksize,
+-							src == dst);
++							src == dst, false);
+ 			if (src ==  dst)
+ 				dst_align = src_align;
+ 			else
+ 				dst_align = eip93_is_sg_aligned(dst, totlen_dst,
+-								blksize, true);
++							blksize, true, false);
+ 		} else {
+ 			src_align = false;
+ 			dst_align = false;
+ 		}
+ 	} else {
+-		src_align = eip93_is_sg_aligned(src, totlen_src, blksize, src == dst);
++		src_align = eip93_is_sg_aligned(src, totlen_src, blksize, src == dst,
++						allow_unaligned);
+ 		if (src == dst)
+ 			dst_align = src_align;
+ 		else
+-			dst_align = eip93_is_sg_aligned(dst, totlen_dst, blksize, true);
++			dst_align = eip93_is_sg_aligned(dst, totlen_dst, blksize, true, false);
+ 	}
+ 
+ 	/* Basic hash-decrypt writes a digest; it does not verify the input tag. */
+@@ -501,6 +513,8 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 	bool nextin = false;
+ 	bool nextout = false;
+ 	int offsetout = 0;
++	unsigned int descriptor = 0;
++	bool debug = !rctx->authsize && READ_ONCE(eip93_skcipher_dma_debug);
+ 
+ 	if (IS_ECB(rctx->flags))
+ 		rctx->sa_state_base = 0;
+@@ -596,6 +610,10 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 			cdesc->user_id |= FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS,
+ 						     EIP93_DESC_LAST);
+ 
++		if (debug)
++			dev_info(eip93->dev,
++				 "skcipher desc: id=%d index=%u src=%#x dst=%#x len=%u last=%d\n",
++				 rctx->request_id, descriptor++, src_addr, dst_addr, len, !n);
+ 		eip93_put_descriptor(eip93, cdesc);
+ 	} while (n);
+ 
+@@ -754,6 +772,15 @@ skip_iv:
+ 			 src != reqsrc, dst != reqdst, src->offset, dst->offset,
+ 			 &rctx->sa_record_base, &rctx->sa_state_base,
+ 			 readl(eip93->base + EIP93_REG_PE_DMA_CONFIG));
++	if (!rctx->authsize && READ_ONCE(eip93_skcipher_dma_debug))
++		dev_info(eip93->dev,
++			 "skcipher DMA: id=%d flags=%#x text=%u src=%pad dst=%pad src_map=%u dst_map=%u src_copy=%d dst_copy=%d src_off=%u dst_off=%u src_nents=%d dst_nents=%d dma_cfg=%#x thresholds=%#x\n",
++			 rctx->request_id, flags, rctx->textsize, &sg_dma_address(src),
++			 &sg_dma_address(dst), sg_dma_len(src), sg_dma_len(dst),
++			 src != reqsrc, dst != reqdst, src->offset, dst->offset,
++			 rctx->src_nents, rctx->dst_nents,
++			 readl(eip93->base + EIP93_REG_PE_DMA_CONFIG),
++			 readl(eip93->base + EIP93_REG_PE_BUF_THRESH));
+ 
+ 	return eip93_scatter_combine(eip93, rctx, datalen, split, offsetin);
+ 
+diff --git a/eip93-common.h b/eip93-common.h
+index 47fde69..4cad67b 100644
+--- a/eip93-common.h
++++ b/eip93-common.h
+@@ -11,6 +11,7 @@
+ 
+ extern bool eip93_aead_debug;
+ extern bool eip93_aead_dma_debug;
++extern bool eip93_skcipher_dma_debug;
+ 
+ int eip93_alloc_req_id(struct eip93_device *eip93,
+ 		       struct crypto_async_request *async);
+diff --git a/eip93-main.c b/eip93-main.c
+index b5d9846..b11dc25 100644
+--- a/eip93-main.c
++++ b/eip93-main.c
+@@ -277,6 +277,11 @@ get_more:
+ 	/* Parse error in ctrl stat word */
+ 	err = eip93_parse_ctrl_stat_err(eip93, err);
+ 
++	if ((desc_flags & EIP93_DESC_SKCIPHER) && READ_ONCE(eip93_skcipher_dma_debug))
++		dev_info(eip93->dev,
++			 "skcipher done: id=%u ctrl=%#x len=%#x err=%d\n",
++			 crypto_idr, pe_ctrl_stat, pe_length, err);
++
+ 	if (desc_flags & EIP93_DESC_SKCIPHER)
+ 		eip93_skcipher_handle_result(async, err);
+ 
+-- 
+2.52.0
+

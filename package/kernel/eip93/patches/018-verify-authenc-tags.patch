@@ -1,0 +1,193 @@
+From d935c21ead15c517e3f66f117c37b0150b4f8e2c Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 17:47:18 +0800
+Subject: [PATCH] crypto: eip93 - verify authenc tags after basic hash-decrypt
+
+Basic hash-decrypt computes an HMAC but does not compare it with an input
+tag. The authentication error status documented for protocol operations
+cannot replace that comparison. The driver disables digest output on
+decryption and completes corrupted tags, ciphertext and AAD successfully.
+The direct test exposed this with authenc(hmac(md5),cbc(aes)), a 16-byte
+payload, 8-byte AAD, 65-byte HMAC key and an 8-byte tag.
+
+Retain digest output and always decrypt authenc into a separate buffer
+with room for the computed tag. This preserves the received tag even for
+in-place or aliasing scatterlists and prevents writing beyond the caller's
+plaintext destination. After unmapping both buffers, normalize SHA digest
+words with unaligned-safe accesses and compare the tags with
+crypto_memneq(). Return EBADMSG on mismatch and only copy a successful
+result back. Preserve hardware errors and release both bounce buffers on
+all completion paths. Authentication and decryption remain on hardware.
+
+The SHARC+ hardware reference describes basic operations in table 44-25,
+protocol authentication errors in table 44-28 and digest output in table
+44-69. The descriptor length continues to exclude the received tag.
+
+Host GCC 14.2 W=1 builds the complete module. Under QEMU TCG, the existing
+test module reproduces acceptance of a bad tag before the fix and passes
+192 cases across all sixteen authenc algorithms after it. The fixture
+uses the actual AEAD front ends, SA setup, SG preparation and completion
+code, but models crypto using synchronous software and stubs DMA. Device
+validation of the digest output is still required.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-aead.c   |  2 +-
+ eip93-cipher.c |  2 +-
+ eip93-cipher.h |  4 ++--
+ eip93-common.c | 47 ++++++++++++++++++++++++++++++-----------------
+ 4 files changed, 34 insertions(+), 21 deletions(-)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 7c700eb..aa281b5 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -34,7 +34,7 @@ void eip93_aead_handle_result(struct crypto_async_request *async, int err)
+ 	struct aead_request *req = aead_request_cast(async);
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+ 
+-	eip93_unmap_dma(eip93, rctx, req->src, req->dst);
++	err = eip93_unmap_dma(eip93, rctx, req->src, req->dst, err);
+ 	eip93_handle_result(eip93, rctx, req->iv);
+ 
+ 	aead_request_complete(req, err);
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index 9ce90bb..d57f225 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -24,7 +24,7 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
+ 	struct skcipher_request *req = skcipher_request_cast(async);
+ 	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
+ 
+-	eip93_unmap_dma(eip93, rctx, req->src, req->dst);
++	err = eip93_unmap_dma(eip93, rctx, req->src, req->dst, err);
+ 	eip93_handle_result(eip93, rctx, req->iv);
+ 
+ 	skcipher_request_complete(req, err);
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index 01a246f..5e09f84 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -47,8 +47,8 @@ struct eip93_cipher_reqctx {
+ 	struct skcipher_request		fallback_req;
+ };
+ 
+-void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+-		     struct scatterlist *reqsrc, struct scatterlist *reqdst);
++int eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
++		    struct scatterlist *reqsrc, struct scatterlist *reqdst, int err);
+ 
+ int eip93_skcipher_submit(struct crypto_async_request *async);
+ 
+diff --git a/eip93-common.c b/eip93-common.c
+index f26222b..b7f9998 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <crypto/aes.h>
++#include <crypto/algapi.h>
+ #include <crypto/ctr.h>
+ #include <crypto/hmac.h>
+ #include <crypto/sha1.h>
+@@ -14,6 +15,7 @@
+ #include <linux/kernel.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/scatterlist.h>
++#include <linux/unaligned.h>
+ 
+ #include "eip93-cipher.h"
+ #include "eip93-hash.h"
+@@ -310,6 +312,10 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 			dst_align = eip93_is_sg_aligned(dst, totlen_dst, blksize, true);
+ 	}
+ 
++	/* Basic hash-decrypt writes a digest; it does not verify the input tag. */
++	if (authsize && IS_DECRYPT(rctx->flags))
++		dst_align = false;
++
+ 	copy_len = max(totlen_src, totlen_dst);
+ 	if (!src_align) {
+ 		err = eip93_make_sg_copy(src, &rctx->sg_src, copy_len, true);
+@@ -579,8 +585,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ 			FIELD_PREP(EIP93_SA_CMD_HASH_CRYPT_OFFSET,
+ 				   rctx->assoclen / sizeof(u32));
+ 		if (IS_DECRYPT(flags))
+-			rctx->sa_record->sa_cmd1_word &= ~(EIP93_SA_CMD_COPY_PAD |
+-							 EIP93_SA_CMD_COPY_DIGEST);
++			rctx->sa_record->sa_cmd1_word &= ~EIP93_SA_CMD_COPY_PAD;
+ 	}
+ 
+ 	rctx->sa_record_base = dma_map_single(eip93->dev, rctx->sa_record,
+@@ -709,13 +714,13 @@ free_sg_copy:
+ 	return err;
+ }
+ 
+-void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+-		     struct scatterlist *reqsrc, struct scatterlist *reqdst)
++int eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
++		    struct scatterlist *reqsrc, struct scatterlist *reqdst, int err)
+ {
+ 	u32 len = rctx->assoclen + rctx->textsize;
+ 	u32 authsize = rctx->authsize;
+ 	u32 flags = rctx->flags;
+-	u32 *otag;
++	u8 *otag;
+ 	int i;
+ 
+ 	if (rctx->sg_src == rctx->sg_dst) {
+@@ -727,30 +732,38 @@ void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rct
+ 	dma_unmap_sg(eip93->dev, rctx->sg_src, rctx->src_nents,
+ 		     DMA_TO_DEVICE);
+ 
+-	if (rctx->sg_src != reqsrc)
+-		eip93_free_sg_copy(len +  rctx->authsize, &rctx->sg_src);
+-
+ 	dma_unmap_sg(eip93->dev, rctx->sg_dst, rctx->dst_nents,
+ 		     DMA_BIDIRECTIONAL);
+ 
+-	/* SHA tags need conversion from net-to-host */
+ process_tag:
+-	if (IS_DECRYPT(flags))
+-		authsize = 0;
+-
+-	if (authsize) {
++	if (!err && authsize) {
++		otag = sg_virt(rctx->sg_dst) + len;
++		/* Convert the hardware's SHA digest words to tag bytes. */
+ 		if (!IS_HASH_MD5(flags)) {
+-			otag = sg_virt(rctx->sg_dst) + len;
+ 			for (i = 0; i < (authsize / 4); i++)
+-				otag[i] = be32_to_cpu((__be32 __force)otag[i]);
++				put_unaligned_be32(get_unaligned((u32 *)(otag + i * 4)),
++						   otag + i * 4);
+ 		}
++		/* The separate output buffer preserves the tag even in-place. */
++		if (IS_DECRYPT(flags) &&
++		    crypto_memneq(sg_virt(rctx->sg_src) + len, otag, authsize))
++			err = -EBADMSG;
+ 	}
+ 
++	if (rctx->sg_src != rctx->sg_dst && rctx->sg_src != reqsrc)
++		eip93_free_sg_copy(len + rctx->authsize, &rctx->sg_src);
++
++	if (IS_DECRYPT(flags))
++		authsize = 0;
++
+ 	if (rctx->sg_dst != reqdst) {
+-		sg_copy_from_buffer(reqdst, sg_nents(reqdst),
+-				    sg_virt(rctx->sg_dst), len + authsize);
++		if (!err)
++			sg_copy_from_buffer(reqdst, sg_nents(reqdst),
++					    sg_virt(rctx->sg_dst), len + authsize);
+ 		eip93_free_sg_copy(len + rctx->authsize, &rctx->sg_dst);
+ 	}
++
++	return err;
+ }
+ 
+ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+-- 
+2.52.0
+
