@@ -16,6 +16,71 @@ explicitly and can test either EIP93 package; it does not require kTLS.
 Test release 7 extends inverse-block failure diagnostics from ECB to CBC,
 including the initial IV or preceding ciphertext used for chaining.
 
+Test release 10 also includes an [aligned CTR throughput sweep](eip93-test/README.ctr-bench.md)
+through the Crypto API. For an independent baseline,
+[`kmod-eip93-hw-test`](eip93-hw-test/README.md) supplies `eip93_hw_test.ko`,
+which measures NULL-copy and AES-CTR directly using registers, DMA rings
+and IRQs. It claims the device exclusively with the normal driver unloaded.
+This separate package does not copy or depend on the crypto driver's sources.
+Both benchmarks accept exact byte lengths, including common TCP MSS sizes.
+Standalone hardware test release 6 adds the default-off `dma_skip_cpu_sync`
+option to compare payload mappings without cache synchronization.
+
+[`kmod-ghash-bench`](ghash-bench/README.md) measures the other half of generic
+GCM through the Crypto API's ahash interface. On ARM64 it selects the
+`ghash`, `ghash-generic` and `ghash-neon` implementations and includes a
+separate [`ghash-neon-shuffle`](crypto-ghash-neon-shuffle/README.md) module
+for explicit comparison with the built-in or modular stock driver. Release 11
+of that module exposes `ghash-neon-sched` for instruction-scheduling tests
+and `ghash-neon-gpr` for next-block input loads through two general-purpose
+registers, plus `ghash-neon-2x` for two-block aggregation with one reduction
+and `ghash-neon-2x-pmull` for a byte-PMULL reduction comparison. The separate
+`ghash-neon-pmull` tests that reducer without aggregation against scheduled.
+`ghash-neon-orig-pmull` changes only the stock loop's reducer, preserving
+its multiplication, ZIP/EXT reconstruction and input-load order.
+`ghash-neon-fused` precomputes a folded key and combines multiplication
+with reduction, using two product sums and one final fold per block.
+It passes build/static and device short/SG checks, but runs 7.7--8.1% slower
+than original-loop PMULL at 1440 through 65536 bytes in both benchmark orders.
+`ghash-neon-2x-reuse` alternates the two-block PMULL product order to retain
+one key table, reducing table reads from 240 to 160 bytes for each pair after
+the first. It passes build/static and device short/SG checks, gaining
+4.8--5.5% over two-block PMULL at 1440 through 65536 bytes in both orders.
+`ghash-neon-2x-load` keeps that reuse and overlaps remaining key-table loads
+with multiplication using six caller-saved GPRs and 64-bit NEON loads/lane
+inserts. It passes ARM64 build, LE/BE static checks and device short/SG/GCM
+boundary checks across three seeds. Bulk measurements gain 6.2--6.8% over
+`ghash-neon-2x-reuse` in both orders, reaching 1.488306 Gbit/s at 64 KiB.
+QEMU TCG passes 720 existing benchmark rows with full crypto self-tests and
+KASAN, plus 2,880 direct-shash comparisons through 131,089 bytes to cover
+the internal 64 KiB loop limit and exported/imported state. No driver fixes
+were needed; QEMU rates are not used as device throughput measurements.
+Release 11 adds `ghash-neon-4x`, sharing three product reconstructions and
+one reduction per four blocks, with precomputed H^3/H^4 and the existing
+`ghash-neon-2x-load` short/tail path. It retains key-load scheduling and
+register-only accumulation. Build/static checks, 922 QEMU benchmark rows
+and 5,400 direct-shash comparisons through 131,121 bytes pass with full
+crypto self-tests and KASAN. The device comparison passes 180 rows and
+111,185,351 timed requests, gaining 19.3% at 1440 bytes and about 22.5% at
+16384 through 65536 bytes in both orders. At 64 KiB, pooled median throughput
+rises from 1.488876 to 1.823721 Gbit/s, making four-block aggregation the
+fastest measured bulk variant. This capture uses raw single-entry input and
+one seed; reference/final-slot and guard checks pass, with intermediate
+digests reused. It does not measure complete GCM or kTLS performance.
+All previous implementations remain available for comparison.
+Benchmark release 2 recognizes an already registered stock driver without
+loading `ghash-ce.ko`; that package is optional. It supports MSS and full-record
+sizes, SG chunking, request depths, optional GCM-formatted AAD and CPU-time reporting.
+An independent GHASH reference checks digests outside timing. It requires
+neither kTLS nor EIP93, and leaves the production driver's bouncing behavior
+unchanged. See its README for the first comparison and interpretation limits.
+
+The separate userspace [`memcpy-bench`](../utils/memcpy-bench/README.md)
+package provides a CPU-copy baseline. It streams libc copies through two
+128 MiB buffers by default, supports copy blocks up to 128 MiB, and reports
+verified payload throughput, CPU time and page faults. It can also be built
+directly from its standalone C source without any kernel test module.
+
 Module compilation uses Kbuild's external-module `M=...` interface. Package
 patches affect only the private copy. Changing one of these patches therefore
 does not require recompiling the kernel itself, provided its configuration and
@@ -57,7 +122,7 @@ It must not be used with NIC drivers compiled against the original RX layout.
 including PonWrt's small-request software fallback patch. Release 27 disables
 that size-based AES fallback by default so small requests exercise hardware.
 The load-time `aes_sw_fallback=1` option restores the stock thresholds
-(AES-192/256: 256 bytes; AES-128: 512 bytes). Release 36 keeps the raw
+(AES-192/256: 256 bytes; AES-128: 512 bytes). Release 37 keeps the raw
 `dma_maxburst=6` default and 64/64 DMA buffer thresholds. Read-only AES
 skcipher sources can be byte-aligned; DES/3DES and all native authenc sources
 require word alignment or bounce. The earlier short-authenc-only guard
@@ -104,6 +169,32 @@ reserved, and completion uses one ordinary bounced-output copy. This
 removes intermediate gaps and repeated destination SG walks. Source reads,
 independent counters and the default-off option are retained. See the
 [overlapping-output replay](eip93-test/README.md#contiguous-ctr-output).
+Release 37 adds default-off aggregate skcipher profiling and an installed
+`eip93-measure-ktls` runner. It separates paths and directions and measures
+ID allocation, preparation, DMA mapping, submission and completion without
+per-request logging. The runner saves uninstrumented throughput controls
+and restores the settings it changes. See the
+[profiling command and timing definitions](eip93/README.profile.md).
+
+The subsequent release-37 device report records a plaintext mismatch with
+tail alignment off at input threshold `0x40`. At threshold zero, both
+20-trial captures pass, with a 7.23% median throughput loss when tail
+alignment is enabled. GHASH dominates active kernel sampling. See the
+[device perf comparison](eip93/README.profile.md#device-perf-comparison-at-input-threshold-zero).
+The subsequent runner capture also passes: avoiding source copies cuts
+preparation time from 23.39 to 12.51 us per request, but descriptors rise
+from 1.42 to 2.78 and aggregate throughput falls 9.25% in the uninstrumented
+controls. Completion/copyback time is unchanged or lower; longer pending
+time includes queueing and does not directly measure AES execution. See
+the [device stage counters](eip93/README.profile.md#device-stage-counters-at-input-threshold-zero).
+
+Test package release 10 includes a separate `eip93_ctr_bench.ko` module for
+aligned CTR length sweeps, including partial final blocks. It uses one
+aligned source/destination SG entry per request and configurable queue
+depths, with software reference
+checks outside the timing windows. See the
+[benchmark commands and accounting](eip93-test/README.ctr-bench.md).
+
 Destination/in-place cache-line isolation and
 private authenc decryption output remain enforced. See the
 [normal-use test](eip93-test/README.md#normal-use-policy) before enabling any
@@ -225,8 +316,9 @@ The EIP93 patches apply in filename order, with each fix in its own commit:
 | 041 | Extend opt-in CTR tail alignment to multi-entry sources with independent logical counters and padded output slots. |
 | 042 | Handle AES blocks split across CTR source entries with software boundary processing and direct hardware spans. |
 | 043 | Overlap CTR overread output at logical offsets and copy back the contiguous result in one SG walk. |
+| 044 | Add opt-in aggregate skcipher stage timings and descriptor/copy counters, separated by path and direction. |
 
-Apply all forty-two patches in filename order through 043. Patch 012
+Apply all forty-three patches in filename order through 044. Patch 012
 remains withdrawn; patch 028's retry with lower DMA thresholds is reverted
 by patch 029.
 Patches 004–008 make preparation, completion and

@@ -6,6 +6,18 @@ no device binding, changes no EIP93 registers and is never loaded automatically.
 It works with either the stock or out-of-tree EIP93 module. Load that driver
 first; this package deliberately does not select one of the competing drivers.
 
+Release 10 supplies `eip93_ctr_bench.ko` for a separate
+[aligned CTR length and queue-depth throughput sweep](README.ctr-bench.md).
+The correctness matrix and its replay case numbers are unchanged.
+
+The separate [standalone hardware test](../eip93-hw-test/README.md) measures
+NULL-copy and AES-CTR without the EIP93 crypto driver. It binds the hardware
+directly and must be run with the normal driver unloaded.
+
+For the remaining kTLS throughput difference, driver release 37 adds
+[aggregate profiling and a capture runner](../eip93/README.profile.md).
+These measurements are separate from this correctness module.
+
 The test chooses each **EIP93 driver name explicitly**, avoiding generic-name
 selection of a software implementation. It compares against explicitly named
 software implementations and includes 44 known-answer vectors selected from

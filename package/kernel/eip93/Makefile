@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=eip93
-PKG_RELEASE:=36
+PKG_RELEASE:=37
 PKG_LICENSE:=GPL-2.0-only
 PKG_BUILD_PARALLEL:=1
 
@@ -52,6 +52,11 @@ endef
 
 define Build/Compile
 	+$(KERNEL_MAKE) $(PKG_JOBS) M="$(PKG_BUILD_DIR)" modules
+endef
+
+define KernelPackage/eip93/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./files/eip93-measure-ktls $(1)/usr/bin/
 endef
 
 $(eval $(call KernelPackage,eip93))
