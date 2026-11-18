@@ -1,0 +1,67 @@
+From 054dac15f156b8ddf904da8c3020ceab388f260c Mon Sep 17 00:00:00 2001
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Thu, 4 Jun 2026 13:48:27 -0400
+Subject: [PATCH] tls: Factor tls_strp_msg_consume() from tls_strp_msg_done()
+
+tls_strp_msg_done() conflates releasing the current record with
+checking for the next one via tls_strp_check_rcv(). A subsequent
+patch needs to release a record without immediately triggering
+that check, so the release step is separated into
+tls_strp_msg_consume(). tls_strp_msg_done() is preserved as a
+wrapper for existing callers.
+
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Alistair Francis <alistair.francis@wdc.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+Link: https://patch.msgid.link/20260604-tls-read-sock-v12-4-b114efa6e3e2@oracle.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 8cf0c70ec84de78f8eb21070929a02ee2d98158e
+ ("tls: Factor tls_strp_msg_consume() from tls_strp_msg_done()"))
+---
+ net/tls/tls.h      |  1 +
+ net/tls/tls_strp.c | 11 ++++++++++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/net/tls/tls.h b/net/tls/tls.h
+index 12f44cb649c9..cb0091e03f41 100644
+--- a/net/tls/tls.h
++++ b/net/tls/tls.h
+@@ -194,6 +194,7 @@ int tls_strp_init(struct tls_strparser *strp, struct sock *sk);
+ void tls_strp_data_ready(struct tls_strparser *strp);
+ 
+ void tls_strp_check_rcv(struct tls_strparser *strp);
++void tls_strp_msg_consume(struct tls_strparser *strp);
+ void tls_strp_msg_done(struct tls_strparser *strp);
+ 
+ int tls_rx_msg_size(struct tls_strparser *strp, struct sk_buff *skb);
+diff --git a/net/tls/tls_strp.c b/net/tls/tls_strp.c
+index c0611c432776..12b0894a5815 100644
+--- a/net/tls/tls_strp.c
++++ b/net/tls/tls_strp.c
+@@ -587,7 +587,12 @@ static void tls_strp_work(struct work_struct *w)
+ 	release_sock(strp->sk);
+ }
+ 
+-void tls_strp_msg_done(struct tls_strparser *strp)
++/* Release the current record without triggering a check for the
++ * next record. Callers must invoke tls_strp_check_rcv() before
++ * releasing the socket lock, or queued data will stall until the
++ * next tls_strp_data_ready() event.
++ */
++void tls_strp_msg_consume(struct tls_strparser *strp)
+ {
+ 	WARN_ON(!strp->stm.full_len);
+ 
+@@ -598,7 +603,11 @@ void tls_strp_msg_done(struct tls_strparser *strp)
+ 
+ 	WRITE_ONCE(strp->msg_ready, 0);
+ 	memset(&strp->stm, 0, sizeof(strp->stm));
++}
+ 
++void tls_strp_msg_done(struct tls_strparser *strp)
++{
++	tls_strp_msg_consume(strp);
+ 	tls_strp_check_rcv(strp);
+ }
+ 
