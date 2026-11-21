@@ -1,7 +1,7 @@
 # Standalone ARM64 NEON GHASH comparison drivers
 
 `kmod-crypto-ghash-neon-shuffle` supplies `ghash_neon_shuffle.ko` for a
-matching Linux 6.18 kernel. Release 12 registers algorithm `ghash` under twelve
+matching Linux 6.18 kernel. Release 13 registers algorithm `ghash` under thirteen
 unique Crypto API driver names:
 
 - **`ghash-neon-shuffle`** retains the release-1 shuffle implementation.
@@ -16,6 +16,7 @@ unique Crypto API driver names:
 - **`ghash-neon-2x-load`** overlaps the remaining key loads with multiplication.
 - **`ghash-neon-4x`** accumulates four blocks before reconstruction and reduction.
 - **`ghash-neon-8x`** accumulates eight blocks, rereading input to avoid spills.
+- **`ghash-neon-orig-pmull13`** shortens the original-loop PMULL reducer to 13 instructions.
 
 Each name always selects its own implementation; there is no switching parameter.
 
@@ -30,10 +31,10 @@ extension, although the stock Linux 6.18 driver does not register standalone
 
 Priorities 99 (shuffle), 98 (sched), 97 (gpr), 96 (2x), 95 (2x-pmull),
 94 (pmull), 93 (orig-pmull), 92 (fused), 91 (2x-reuse), 90 (2x-load),
-89 (4x) and 88 (8x) are below stock
+89 (4x), 88 (8x) and 87 (orig-pmull13) are below stock
 `ghash-neon` (150) and `ghash-generic` (100), so
 stock implementations win selection by `ghash`. Select the experimental drivers explicitly.
-Crypto API module aliases cover only these twelve unique names. The package has no
+Crypto API module aliases cover only these thirteen unique names. The package has no
 autoload or conflict entry and does not change `CONFIG_CRYPTO_GHASH_ARM64_CE`.
 
 ## Build and load
@@ -1378,3 +1379,75 @@ and guards pass. The guest shuts down without KASAN reports, warnings or
 crypto self-test failures. QEMU rates do not establish A53 performance;
 big-endian validation remains build/static only. No OpenWrt package/image
 was built.
+
+## Thirteen-instruction reducer experiment (release 13)
+
+`ghash-neon-orig-pmull13` compares a shorter byte-PMULL reducer with
+`ghash-neon-orig-pmull`, the existing 15-instruction reducer used by the
+Linux `ghash-neon-pmull-reduction` branch. It retains the stock loop's
+input loads, Karatsuba products, ZIP/EXT reconstruction and 16-byte key
+context. This experiment does not use aggregation or the scheduled loop.
+
+The existing reducer forms packed low and high bytes of the products of
+each input byte with `0xc2`. Its correction needs only the product of the
+first low byte with `0xc2`, placed at bits 112..127. Rotate the low bytes
+first, moving that byte to lane 15, then use byte `PMULL2` with a constant
+whose only nonzero byte is `0xc2` in lane 15. The correction lands directly
+in the required position, removing the per-block zero-vector `MOVI` and
+correction-placement `EXT`. Two instructions initialize the additional
+constant in `v29` once per assembly call.
+
+The reducer has 13 instructions and five shuffles, versus 15 and six.
+The little-endian loop falls from 135 to 133 instructions and still uses
+27 byte polynomial multiplies. No input/key loads or spills are added.
+Setup costs and dependencies still matter, especially for single-block
+calls; this instruction count does not establish a speedup on Cortex-A53.
+
+After installing release 13, unload `ghash_bench` if necessary and reload
+`ghash_neon_shuffle`. Benchmark release 2 works unchanged. Check the new
+variant's short inputs and fragmented input first:
+
+```sh
+rmmod ghash_neon_shuffle
+modprobe ghash_neon_shuffle
+insmod ghash_bench drivers=ghash-neon-orig-pmull,ghash-neon-orig-pmull13 \
+    lengths=1,2,3,15,16,17,31,32,33,63,64,65,1440,16384,16400,65536 \
+    depths=1,32 duration_ms=10 warmup_ms=0 runs=1
+rmmod ghash_bench
+insmod ghash_bench drivers=ghash-neon-orig-pmull13 lengths=4097 sg_chunk=17 \
+    depths=1 duration_ms=10 warmup_ms=0 runs=1
+rmmod ghash_bench
+```
+
+Then compare the reducers in both orders, pinned to one CPU. The short
+sizes expose the per-call setup cost; 1440 bytes represents a common TCP
+MSS, and 16384/16400 bytes cover TLS-sized GHASH inputs:
+
+```sh
+for order in ghash-neon-orig-pmull,ghash-neon-orig-pmull13 \
+             ghash-neon-orig-pmull13,ghash-neon-orig-pmull; do
+    taskset -c 0 insmod ghash_bench drivers="$order" \
+        lengths=16,32,64,1440,16384,16400,65536 depths=1 \
+        duration_ms=1000 warmup_ms=100 runs=5 || break
+    rmmod ghash_bench || break
+done
+```
+
+The external module builds against Linux 6.18.63 with ARM64 GCC 14 and
+`W=1 KCFLAGS=-Werror`; strict checkpatch passes. Little- and big-endian
+assembly checks confirm the counts above and unchanged encodings for all
+twelve previous functions. Symbolic execution proves equivalence to the
+15-instruction reducer, preserved live registers and correct Montgomery
+reduction for all 256 product basis bits. C wrappers call assembly directly.
+
+The QEMU TCG Cortex-A53 guest passes 57 benchmark insertions, 1440 rows
+and 94,515 timed requests with full crypto self-tests and KASAN enabled.
+All thirteen comparison drivers report passed self-tests. Coverage includes
+every byte length 1..257 with three seeds, block/page/64 KiB boundaries,
+fragmented SGs, depths 1/32/128, GCM formatting and unload/reload. Another
+13,560 direct-shash comparisons against `ghash-generic` cover empty input
+through 131,201 bytes, four source offsets, three keys, digest/update/final
+and export/import/finup. Digests, source contents and guards pass, with no
+kernel warnings or KASAN reports. Big-endian validation is build/static
+only. QEMU validates correctness, not A53 throughput; no OpenWrt package
+or image was built.

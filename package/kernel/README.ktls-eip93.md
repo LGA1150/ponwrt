@@ -77,6 +77,14 @@ comparison: 220 rows and 123,849,377 timed requests pass, but 8x is
 both orders. The 16--64 KiB medians are within 0.07% of 4x. Keep 4x as
 the preferred implementation; the capture has the same verification
 limits as the four-block measurements above.
+Release 13 adds `ghash-neon-orig-pmull13`, a separate 13-instruction
+byte-PMULL reducer for comparison with the original-loop 15-instruction
+variant. A masked constant places the correction product directly in the
+high two bytes, saving two instructions per block and adding two setup
+instructions per call. The little-endian loop has 133 instructions with
+the original input loads, products and key format. Device performance
+remains to be measured; see the
+[comparison commands](crypto-ghash-neon-shuffle/README.md#thirteen-instruction-reducer-experiment-release-13).
 All previous implementations remain available for comparison.
 Benchmark release 2 recognizes an already registered stock driver without
 loading `ghash-ce.ko`; that package is optional. It supports MSS and full-record

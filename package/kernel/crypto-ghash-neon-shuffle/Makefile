@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=crypto-ghash-neon-shuffle
-PKG_RELEASE:=12
+PKG_RELEASE:=13
 PKG_LICENSE:=GPL-2.0-only
 PKG_BUILD_PARALLEL:=1
 PKG_FILE_DEPENDS:=$(wildcard $(CURDIR)/src/*)
@@ -26,6 +26,7 @@ define KernelPackage/crypto-ghash-neon-shuffle/description
   ghash-neon-2x-pmull below the stock drivers' priority. ghash-neon-pmull
   tests the same byte-PMULL reducer with one block per iteration.
   ghash-neon-orig-pmull changes only the stock loop's reduction.
+  ghash-neon-orig-pmull13 tests a 13-instruction version of that reducer.
   ghash-neon-fused folds part of reduction into a precomputed hash key.
   ghash-neon-2x-reuse retains the last key table between PMULL block pairs.
   ghash-neon-2x-load overlaps the remaining key-table loads with multiplication.
