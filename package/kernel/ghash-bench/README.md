@@ -10,7 +10,7 @@ EIP93 registers. The normal EIP93 driver may remain loaded.
 On ARM64 the default driver list is `ghash,ghash-generic,ghash-neon`.
 From release 2 the package selects the separate
 [`kmod-crypto-ghash-neon-shuffle`](../crypto-ghash-neon-shuffle/README.md)
-comparison module on ARM64. Release 16 of that module supplies
+comparison module on ARM64. Release 17 of that module supplies
 `ghash-neon-shuffle`, `ghash-neon-sched`, `ghash-neon-gpr`, `ghash-neon-2x`
 and `ghash-neon-2x-pmull`, plus `ghash-neon-pmull` without aggregation
 and `ghash-neon-orig-pmull` with only the stock loop's reducer changed.
@@ -25,6 +25,7 @@ widening products, respectively, with the same byte-PMULL reducer.
 `ghash-neon-orig-pmull12` combines byte extraction and rotation in a
 12-instruction reducer.
 `ghash-neon-4x-pmull12` applies it to four-block aggregation.
+`ghash-neon-4x-pmull13` compares its UZP/EXT version in the four-block loop.
 Select them explicitly alongside `ghash-neon`.
 The default driver list is unchanged.
 On other architectures the default list is `ghash,ghash-generic`.
@@ -172,7 +173,8 @@ and `ghash-neon-fused`, plus `ghash-neon-2x-reuse`, `ghash-neon-2x-load`
 and `ghash-neon-4x`, plus (module release 12) `ghash-neon-8x` and
 (module release 13) `ghash-neon-orig-pmull13`, plus (module release 14)
 `ghash-neon-pmul` and `ghash-neon-umull`, plus (module release 15)
-`ghash-neon-orig-pmull12`, plus (module release 16) `ghash-neon-4x-pmull12`.
+`ghash-neon-orig-pmull12`, plus (module release 16) `ghash-neon-4x-pmull12`
+and (module release 17) `ghash-neon-4x-pmull13`.
 They can be compared with the built-in `ghash-neon` without rebuilding or
 replacing the kernel. Their priorities are below the stock implementations;
 select the new drivers explicitly. There is no module
@@ -239,7 +241,7 @@ passes short/SG and contiguous checks, gaining 2.8--2.9% over stock for
 1440 through 65536 bytes in both orders (1.2% at 16 bytes). Its bulk medians
 are within 0.07% of the preceding scheduled-PMULL capture; that comparison
 is across captures rather than a direct head-to-head trial. Benchmark
-release 2 works unchanged with all seventeen comparison drivers. It accepts
+release 2 works unchanged with all eighteen comparison drivers. It accepts
 at most eight selected names per insertion, so compare subsets of the
 experimental and stock drivers. The fused variant passes short/SG and contiguous
 checks, but is 1.8% slower at 16 bytes and 7.7--8.1% slower at 1440 through
@@ -283,6 +285,16 @@ of one instruction per four blocks. The key format, table-loading sequence
 and short/tail path are unchanged. See the
 [four-block reducer experiment](../crypto-ghash-neon-shuffle/README.md#four-block-twelve-instruction-reducer-experiment-release-16)
 for boundary checks and measurements in both driver orders.
+The device comparison passes 260 rows, gaining 0.26--0.34% at 16--64 KiB
+in each order, with small short-input regressions.
+
+Module release 17 adds `ghash-neon-4x-pmull13`, keeping the replicated
+multiplier in a register throughout the loop. Its 13-instruction reducer
+and one constant-preparation shift match `4x-pmull12`'s 14 per group,
+while avoiding the additional shuffle-table load and reducing setup by
+three instructions. See the
+[four-block 13-instruction experiment](../crypto-ghash-neon-shuffle/README.md#four-block-thirteen-instruction-reducer-experiment-release-17)
+for comparison commands against both preceding four-block variants.
 
 The release-9 reuse variant alternates low/high/cross and cross/high/low
 product order. It loads 240 key-table bytes for the first pair and 160 for

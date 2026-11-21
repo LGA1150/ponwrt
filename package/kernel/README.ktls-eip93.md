@@ -101,8 +101,15 @@ Release 16 adds `ghash-neon-4x-pmull12`, using that reducer in the
 four-block loop. Two constants are recreated in dead input registers,
 avoiding extra per-group loads or spills. The net saving is one
 instruction per four-block group; keys, table loads and short/tail handling
-are unchanged. A53 throughput is not yet measured. See the
+are unchanged. Device comparisons gain 0.26--0.34% at 16--64 KiB in
+each order, with small short-input regressions. See the
 [comparison commands](crypto-ghash-neon-shuffle/README.md#four-block-twelve-instruction-reducer-experiment-release-16).
+Release 17 adds `ghash-neon-4x-pmull13`, retaining the replicated
+multiplier throughout the four-block loop. It has the same 14 reduction
+and constant-preparation instructions per group as `4x-pmull12`, with
+three fewer setup instructions and no additional shuffle-table load.
+Device performance remains to be measured. See the
+[comparison commands](crypto-ghash-neon-shuffle/README.md#four-block-thirteen-instruction-reducer-experiment-release-17).
 All previous implementations remain available for comparison.
 Benchmark release 2 recognizes an already registered stock driver without
 loading `ghash-ce.ko`; that package is optional. It supports MSS and full-record

@@ -1,7 +1,7 @@
 # Standalone ARM64 NEON GHASH comparison drivers
 
 `kmod-crypto-ghash-neon-shuffle` supplies `ghash_neon_shuffle.ko` for a
-matching Linux 6.18 kernel. Release 16 registers algorithm `ghash` under seventeen
+matching Linux 6.18 kernel. Release 17 registers algorithm `ghash` under eighteen
 unique Crypto API driver names:
 
 - **`ghash-neon-shuffle`** retains the release-1 shuffle implementation.
@@ -21,6 +21,7 @@ unique Crypto API driver names:
 - **`ghash-neon-umull`** uses integer widening products with the generic holes method.
 - **`ghash-neon-orig-pmull12`** combines extraction and rotation in a 12-instruction reducer.
 - **`ghash-neon-4x-pmull12`** applies that reducer to four-block aggregation.
+- **`ghash-neon-4x-pmull13`** tests the 13-instruction reducer with four-block aggregation.
 
 Each name always selects its own implementation; there is no switching parameter.
 
@@ -36,10 +37,10 @@ extension, although the stock Linux 6.18 driver does not register standalone
 Priorities 99 (shuffle), 98 (sched), 97 (gpr), 96 (2x), 95 (2x-pmull),
 94 (pmull), 93 (orig-pmull), 92 (fused), 91 (2x-reuse), 90 (2x-load),
 89 (4x), 88 (8x), 87 (orig-pmull13), 86 (pmul), 85 (umull),
-84 (orig-pmull12) and 83 (4x-pmull12) are below stock
+84 (orig-pmull12), 83 (4x-pmull12) and 82 (4x-pmull13) are below stock
 `ghash-neon` (150) and `ghash-generic` (100), so
 stock implementations win selection by `ghash`. Select the experimental drivers explicitly.
-Crypto API module aliases cover only these seventeen unique names. The package has no
+Crypto API module aliases cover only these eighteen unique names. The package has no
 autoload or conflict entry and does not change `CONFIG_CRYPTO_GHASH_ARM64_CE`.
 
 ## Build and load
@@ -1747,9 +1748,10 @@ For calls of four or more blocks, setup adds three instructions and one
 16-byte fixed-table load. The early short-call branch bypasses this setup.
 No new input or key loads occur inside the loop. The new driver's priority
 is 83; select it explicitly. Existing variants and the separate Linux
-branches retain their implementations. A53 throughput is not yet measured.
+branches retain their implementations. Device results below show a small
+bulk gain and short-input regressions.
 
-Install module release 16 and reload `ghash_neon_shuffle`; benchmark
+Install module release 16 or later and reload `ghash_neon_shuffle`; benchmark
 release 2 works unchanged. Check group boundaries and fragmented input:
 
 ```sh
@@ -1804,6 +1806,133 @@ Another 18,080 direct-shash comparisons against `ghash-generic` cover
 `ghash-neon-4x` and `ghash-neon-4x-pmull12`, with 9,040 cases each. They
 include empty input through 131,201 bytes, four source offsets, four keys
 including all-ones key/data, digest/update/final and export/import/finup
+at three splits. Digest, source and guard checks pass, with no kernel
+warnings or KASAN reports. Big-endian validation is build/static only.
+No OpenWrt package or image was built; QEMU timings are not A53 throughput
+measurements.
+
+### Four-block twelve-instruction reducer device results
+
+Both driver orders pass on the 1.2 GHz Cortex-A53: 260 rows and
+176,973,889 timed requests. The capture uses seed 1708171853, depth 1,
+contiguous raw input, 1000 ms trials, 100 ms warmup and five runs per order.
+Pooled medians from ten trials per driver are:
+
+| Input bytes | `4x`, Mbit/s | `4x-pmull12`, Mbit/s | Change |
+| ---: | ---: | ---: | ---: |
+| 16 | 173.300 | 173.017 | -0.16% |
+| 32 | 321.518 | 321.597 | +0.02% |
+| 48 | 405.208 | 404.917 | -0.07% |
+| 64 | 566.900 | 565.787 | -0.20% |
+| 80 | 605.376 | 603.777 | -0.26% |
+| 112 | 708.381 | 707.334 | -0.15% |
+| 128 | 866.128 | 865.870 | -0.03% |
+| 144 | 863.940 | 861.368 | -0.30% |
+| 256 | 1178.034 | 1178.575 | +0.05% |
+| 1440 | 1648.892 | 1656.752 | +0.48% |
+| 16384 | 1823.008 | 1828.971 | +0.33% |
+| 16400 | 1821.150 | 1826.182 | +0.28% |
+| 65536 | 1823.094 | 1828.988 | +0.32% |
+
+Every new-variant trial exceeds every baseline trial at the same length
+from 1440 bytes upward. The separate orders gain 0.20% and 0.48% at
+1440 bytes, and 0.26--0.34% at 16--64 KiB. The bulk gain is small,
+consistent with saving one instruction per roughly 370-instruction group.
+Extra setup can outweigh that saving for short input. Inputs of 16/32/48
+bytes use the same tail implementation, so their differences are not from
+the reducer. Verification covers preflight/final-slot digests and guards;
+intermediate timed digests are reused.
+
+## Four-block thirteen-instruction reducer experiment (release 17)
+
+`ghash-neon-4x-pmull13` compares the masked 13-instruction reducer with
+both `ghash-neon-4x` and `ghash-neon-4x-pmull12`. It keeps the replicated
+`0xc2` multiplier in `v1` throughout the product loop, as the original
+four-block variant does. After the products and cross-term join finish,
+one `SHL v4.2d, v1.2d, #56` keeps only the lowest byte of each 64-bit
+lane and moves it to the highest byte. Only the upper half feeds the
+correction's byte `PMULL2`, making byte 15 its sole active multiplier byte.
+This uses dead `v4` and needs no scalar register or extra setup. `UZP1`
+followed by `EXT` extracts and rotates the low product bytes; there is no
+additional shuffle-table load.
+
+The 13 reducer instructions plus one constant-preparation instruction
+give the same 14 instructions per group as `4x-pmull12`. Setup is identical
+to the original four-block loop.
+Compared with `4x-pmull12`, this removes the per-group replicated-constant
+`MOVI`, uses `SHL` instead of `DUP`, replaces the reducer's two-register
+`TBL` with `UZP1`/`EXT`, and removes three setup instructions and the
+16-byte table load.
+
+| Work | `4x` | `4x-pmull12` | `4x-pmull13` |
+| --- | ---: | ---: | ---: |
+| Reduction instructions including per-group constant preparation | 15 | 14 | 14 |
+| Forward/reverse instructions, little-endian | 371/376 | 370/375 | 370/375 |
+| Forward/reverse instructions, big-endian | 367/372 | 366/371 | 366/371 |
+| Extra setup instructions per call of four or more blocks | 0 | 3 | 0 |
+| Extra setup bytes loaded | 0 | 16 | 0 |
+| Byte PMULL/PMULL2 instructions per group | 99 | 99 | 99 |
+
+The key context/setkey, products, input packing, alternating table order
+and bounded short/tail path are unchanged. No new spills or input/key
+loads are introduced. Earlier implementations retain their assembly
+encodings, and the new driver's priority 82 keeps selection explicit.
+Device performance remains to be measured.
+
+Install comparison module release 17, reload `ghash_neon_shuffle`, and
+use the unchanged benchmark release 2. First check boundaries and SG input:
+
+```sh
+rmmod ghash_neon_shuffle
+modprobe ghash_neon_shuffle
+insmod ghash_bench drivers=ghash-neon-4x-pmull13 \
+    lengths=1,15,16,17,31,32,33,47,48,49,63,64,65,79,80,81,95,96,97,111,112,113,127,128,129,65535,65536 \
+    depths=1,32 duration_ms=10 warmup_ms=0 runs=1
+rmmod ghash_bench
+for chunk in 47 79 113 1440; do
+    insmod ghash_bench drivers=ghash-neon-4x-pmull13 \
+        lengths=4097 sg_chunk="$chunk" depths=1 \
+        duration_ms=10 warmup_ms=0 runs=1 || break
+    rmmod ghash_bench || break
+done
+```
+
+Then compare the three four-block variants in both orders:
+
+```sh
+for order in ghash-neon-4x,ghash-neon-4x-pmull12,ghash-neon-4x-pmull13 \
+             ghash-neon-4x-pmull13,ghash-neon-4x-pmull12,ghash-neon-4x; do
+    taskset -c 0 insmod ghash_bench drivers="$order" \
+        lengths=16,32,48,64,80,112,128,144,256,1440,16384,16400,65536 \
+        depths=1 duration_ms=1000 warmup_ms=100 runs=5 || break
+    rmmod ghash_bench || break
+done
+```
+
+### Release-17 validation
+
+The external module builds against Linux 6.18.63 with ARM64 GCC 14 and
+`W=1 KCFLAGS=-Werror`; strict checkpatch passes. Little- and big-endian
+assembly checks confirm identical setup to the original four-block loop,
+370/375 and 366/371 instructions in the respective forward/reverse bodies,
+and no additional loads or spills. All seventeen earlier implementations
+retain their assembly encodings. Symbolic checks prove the reducer for
+arbitrary inputs and all 256 product basis bits, the four-term products,
+and preservation of cached keys and shuffle constants. Control-flow checks
+cover 139 block counts through 4096, including input/key bounds and tails.
+
+QEMU TCG Cortex-A53 with KASAN and full crypto self-tests passes 58
+benchmark insertions, 1,504 rows and 75,173 timed requests. The new driver contributes 1,266
+rows covering every byte length 1..257 with three seeds, block/page/64 KiB
+boundaries, fragmented input, depths 1/32/128, warmup, repeated trials,
+GCM formatting and module reload. All eighteen comparison drivers pass
+self-tests. Exact matrices and byte/rate/request accounting are checked
+independently.
+
+Another 18,080 direct-shash comparisons against `ghash-generic` cover
+`ghash-neon-4x-pmull12` and `ghash-neon-4x-pmull13`, with 9,040 cases each.
+They include empty input through 131,201 bytes, four source offsets, four
+keys including all-ones key/data, digest/update/final and export/import/finup
 at three splits. Digest, source and guard checks pass, with no kernel
 warnings or KASAN reports. Big-endian validation is build/static only.
 No OpenWrt package or image was built; QEMU timings are not A53 throughput

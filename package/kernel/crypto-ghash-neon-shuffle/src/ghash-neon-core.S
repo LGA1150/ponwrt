@@ -892,10 +892,13 @@ CPU_LE(	rev64		t6.16b, t6.16b	)
 	eor		T2.16b, XL.16b, XH.16b
 	ext		T1.16b, XL.16b, XH.16b, #8
 	eor		XM.16b, XM.16b, T2.16b
-	.if		\short_reduce
+	.if		\short_reduce == 1
 	movi		T2.16b, #0xc2
 	dup		NEXT.2d, x12
 	__pmull_reduce_p8_mul T2, 1, 1, NEXT, SHASH2
+	.elseif		\short_reduce == 2
+	shl		NEXT.2d, SHASH2.2d, #56
+	__pmull_reduce_p8_mul SHASH2, 1, 0, NEXT
 	.else
 	__pmull_reduce_p8_mul
 	.endif
@@ -908,7 +911,7 @@ CPU_LE(	rev64		t6.16b, t6.16b	)
 	b.lo		ghash_neon_2x_load_blocks
 	ld1		{XL.2d}, [x1]
 	__pmull_pre_p8 0
-	.if		\short_reduce
+	.if		\short_reduce == 1
 	mov		x12, #0xc200000000000000
 	adr_l		x5, .Lghash_neon_reduce_perm
 	ld1		{SHASH2.16b}, [x5]
@@ -1035,6 +1038,10 @@ SYM_FUNC_END(ghash_neon_8x_blocks)
 SYM_FUNC_START(ghash_neon_4x_pmull12_blocks)
 	__ghash_4x 1
 SYM_FUNC_END(ghash_neon_4x_pmull12_blocks)
+
+SYM_FUNC_START(ghash_neon_4x_pmull13_blocks)
+	__ghash_4x 2
+SYM_FUNC_END(ghash_neon_4x_pmull13_blocks)
 
 	.section	".rodata", "a"
 	.align		6
