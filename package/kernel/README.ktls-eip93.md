@@ -94,8 +94,15 @@ at 64 KiB relative to `orig-pmull13`. See the
 Release 15 adds `ghash-neon-orig-pmull12`, combining low-byte extraction
 and rotation with one two-register `TBL`. Its complete loop has 132
 instructions, with three additional setup instructions and one 16-byte
-constant load per call. A53 throughput is not yet measured. See the
+constant load per call. Device comparisons pass and gain 1.4--1.5% at
+1440 through 65536 bytes, with small regressions at 16/32 bytes. See the
 [comparison commands](crypto-ghash-neon-shuffle/README.md#twelve-instruction-reducer-experiment-release-15).
+Release 16 adds `ghash-neon-4x-pmull12`, using that reducer in the
+four-block loop. Two constants are recreated in dead input registers,
+avoiding extra per-group loads or spills. The net saving is one
+instruction per four-block group; keys, table loads and short/tail handling
+are unchanged. A53 throughput is not yet measured. See the
+[comparison commands](crypto-ghash-neon-shuffle/README.md#four-block-twelve-instruction-reducer-experiment-release-16).
 All previous implementations remain available for comparison.
 Benchmark release 2 recognizes an already registered stock driver without
 loading `ghash-ce.ko`; that package is optional. It supports MSS and full-record

@@ -495,7 +495,8 @@ SYM_FUNC_END(ghash_neon_gpr_blocks)
 	 * scheduled single-block loops prepare T2 after their Karatsuba products.
 	 * The original loop keeps the constant in otherwise unused v28.
 	 */
-	.macro		__pmull_reduce_p8_mul, c=SHASH2, masked=0, permute=0
+	.macro		__pmull_reduce_p8_mul, c=SHASH2, masked=0, permute=0, \
+			last=REDUCE_LAST, perm=REDUCE_PERM
 	eor		XM.16b, XM.16b, T1.16b
 	zip1		XL.2d, XL.2d, XM.2d
 	zip2		XH.2d, XM.2d, XH.2d
@@ -504,7 +505,7 @@ SYM_FUNC_END(ghash_neon_gpr_blocks)
 	pmull2		t4.8h, XL.16b, \c\().16b
 	eor		XH.16b, XH.16b, XL.16b
 	.if		\permute
-	tbl		t5.16b, {t3.16b, t4.16b}, REDUCE_PERM.16b
+	tbl		t5.16b, {t3.16b, t4.16b}, \perm\().16b
 	.else
 	uzp1		t5.16b, t3.16b, t4.16b
 	.endif
@@ -513,7 +514,7 @@ SYM_FUNC_END(ghash_neon_gpr_blocks)
 	.if		!\permute
 	ext		t5.16b, t5.16b, t5.16b, #1
 	.endif
-	pmull2		t7.8h, t5.16b, REDUCE_LAST.16b
+	pmull2		t7.8h, t5.16b, \last\().16b
 	.else
 	pmull		t7.8h, t5.8b, \c\().8b
 	ext		t5.16b, t5.16b, t5.16b, #1
@@ -841,7 +842,7 @@ SYM_FUNC_END(ghash_neon_2x_load_blocks)
 	.endm
 
 	/* (Y ^ X1)*H^4 ^ X2*H^3 ^ X3*H^2 ^ X4*H, reduced once. */
-	.macro		__ghash_4x_step, reverse=0
+	.macro		__ghash_4x_step, reverse=0, short_reduce=0
 	ld1		{t3.2d-t6.2d}, [x2], #64
 CPU_LE(	rev64		t3.16b, t3.16b	)
 CPU_LE(	rev64		t4.16b, t4.16b	)
@@ -891,30 +892,46 @@ CPU_LE(	rev64		t6.16b, t6.16b	)
 	eor		T2.16b, XL.16b, XH.16b
 	ext		T1.16b, XL.16b, XH.16b, #8
 	eor		XM.16b, XM.16b, T2.16b
+	.if		\short_reduce
+	movi		T2.16b, #0xc2
+	dup		NEXT.2d, x12
+	__pmull_reduce_p8_mul T2, 1, 1, NEXT, SHASH2
+	.else
 	__pmull_reduce_p8_mul
+	.endif
 	sub		w0, w0, #4
 	cmp		w0, #4
 	.endm
 
-SYM_FUNC_START(ghash_neon_4x_blocks)
+	.macro		__ghash_4x, short_reduce=0
 	cmp		w0, #4
 	b.lo		ghash_neon_2x_load_blocks
 	ld1		{XL.2d}, [x1]
 	__pmull_pre_p8 0
+	.if		\short_reduce
+	mov		x12, #0xc200000000000000
+	adr_l		x5, .Lghash_neon_reduce_perm
+	ld1		{SHASH2.16b}, [x5]
+	.else
 	movi		SHASH2.16b, #0xc2
+	.endif
 	/* The first 256 bytes are the unchanged two-block tail context. */
 	add		x4, x3, #256
 	ld1		{SHASH.2d}, [x4], #16
 	ld1		{sh1.2d-sh4.2d}, [x4], #64
 1:
-	__ghash_4x_step
+	__ghash_4x_step 0, \short_reduce
 	b.lo		2f
-	__ghash_4x_step 1
+	__ghash_4x_step 1, \short_reduce
 	b.hs		1b
 2:
 	st1		{XL.2d}, [x1]
 	cbnz		w0, ghash_neon_2x_load_blocks
 	ret
+	.endm
+
+SYM_FUNC_START(ghash_neon_4x_blocks)
+	__ghash_4x
 SYM_FUNC_END(ghash_neon_4x_blocks)
 
 	/*
@@ -1014,6 +1031,10 @@ SYM_FUNC_START(ghash_neon_8x_blocks)
 	cbnz		w0, ghash_neon_4x_blocks
 	ret
 SYM_FUNC_END(ghash_neon_8x_blocks)
+
+SYM_FUNC_START(ghash_neon_4x_pmull12_blocks)
+	__ghash_4x 1
+SYM_FUNC_END(ghash_neon_4x_pmull12_blocks)
 
 	.section	".rodata", "a"
 	.align		6
