@@ -1,7 +1,7 @@
 # Standalone ARM64 NEON GHASH comparison drivers
 
 `kmod-crypto-ghash-neon-shuffle` supplies `ghash_neon_shuffle.ko` for a
-matching Linux 6.18 kernel. Release 13 registers algorithm `ghash` under thirteen
+matching Linux 6.18 kernel. Release 14 registers algorithm `ghash` under fifteen
 unique Crypto API driver names:
 
 - **`ghash-neon-shuffle`** retains the release-1 shuffle implementation.
@@ -17,6 +17,8 @@ unique Crypto API driver names:
 - **`ghash-neon-4x`** accumulates four blocks before reconstruction and reduction.
 - **`ghash-neon-8x`** accumulates eight blocks, rereading input to avoid spills.
 - **`ghash-neon-orig-pmull13`** shortens the original-loop PMULL reducer to 13 instructions.
+- **`ghash-neon-pmul`** uses truncated byte polynomial products and bit reversal.
+- **`ghash-neon-umull`** uses integer widening products with the generic holes method.
 
 Each name always selects its own implementation; there is no switching parameter.
 
@@ -31,10 +33,10 @@ extension, although the stock Linux 6.18 driver does not register standalone
 
 Priorities 99 (shuffle), 98 (sched), 97 (gpr), 96 (2x), 95 (2x-pmull),
 94 (pmull), 93 (orig-pmull), 92 (fused), 91 (2x-reuse), 90 (2x-load),
-89 (4x), 88 (8x) and 87 (orig-pmull13) are below stock
+89 (4x), 88 (8x), 87 (orig-pmull13), 86 (pmul) and 85 (umull) are below stock
 `ghash-neon` (150) and `ghash-generic` (100), so
 stock implementations win selection by `ghash`. Select the experimental drivers explicitly.
-Crypto API module aliases cover only these thirteen unique names. The package has no
+Crypto API module aliases cover only these fifteen unique names. The package has no
 autoload or conflict entry and does not change `CONFIG_CRYPTO_GHASH_ARM64_CE`.
 
 ## Build and load
@@ -1451,3 +1453,136 @@ and export/import/finup. Digests, source contents and guards pass, with no
 kernel warnings or KASAN reports. Big-endian validation is build/static
 only. QEMU validates correctness, not A53 throughput; no OpenWrt package
 or image was built.
+
+### Thirteen-instruction reducer device results
+
+The Cortex-A53 capture at 1.2 GHz passes both driver orders: 140 rows and
+73,279,616 timed requests. Each order has five one-second trials per
+length, a 100 ms warmup, depth 1, and contiguous raw input. The medians
+below pool the ten observations per configuration and are recalculated
+from byte counts and elapsed time.
+
+| Input bytes | 15-instruction reducer, Mbit/s | 13-instruction reducer, Mbit/s | Change |
+| ---: | ---: | ---: | ---: |
+| 16 | 178.881 | 179.369 | +0.27% |
+| 32 | 308.557 | 309.503 | +0.31% |
+| 64 | 483.560 | 485.494 | +0.40% |
+| 1440 | 1055.845 | 1063.351 | +0.71% |
+| 16384 | 1112.638 | 1120.742 | +0.73% |
+| 16400 | 1112.482 | 1120.672 | +0.74% |
+| 65536 | 1114.254 | 1122.378 | +0.73% |
+
+Both orders show the same direction of change. At 65536 bytes, elapsed
+time at 1.2 GHz corresponds to 8.616 versus 8.553 nominal cycles per byte,
+about one cycle saved per 16-byte block. These are wall-time equivalents,
+not PMU cycle measurements. Verification covers preflight, final-slot
+digests and source/digest guards; intermediate timed digests are reused.
+
+## PMUL and integer UMULL experiments (release 14)
+
+`ghash-neon-pmul` and `ghash-neon-umull` compare alternative full field
+multiplications with `ghash-neon-orig-pmull13`. Each processes one GHASH
+block per iteration and uses the same byte-PMULL Montgomery reducer after
+assembling the 256-bit product. The new names refer to multiplication;
+the final reduction still uses three byte `PMULL`/`PMULL2` instructions.
+All thirteen earlier assembly functions retain their instruction encodings.
+
+`PMUL .16b` retains only the low eight bits of each byte product. The PMUL
+variant interleaves each operand byte with its bit reversal, so a single
+instruction produces both the low product and information about the high
+product. If `rbit8` reverses a byte and `pmul8` returns the truncated
+carryless product, the missing high byte is:
+
+```text
+high = rbit8(pmul8(rbit8(a), rbit8(b))) >> 1
+```
+
+The three 64-bit Karatsuba products retain the stock reconstruction.
+Even and odd byte rotations accumulate separately; a mask selects the
+normal and reversed product bytes before one `RBIT`/shift per 64-bit
+product recovers the high bytes. This avoids recovering the high byte
+separately for every byte multiply. Key expansion stays outside the loop;
+the key context remains 16 bytes. This prototype uses no `TBL` instructions.
+
+`UMULL` and `UMULL2` perform ordinary unsigned integer multiplication,
+with two full 32-by-32-bit products per instruction. Two Karatsuba levels
+split the 128-bit field product into nine `clmul32` operations. Each uses
+the generic implementation's four masks, `0x11111111` through `0x88888888`:
+16 integer products, followed by XOR and masks, recover a carryless
+32-by-32-bit product. At most eight one-bit terms overlap in each
+four-bit column, so carries cannot enter the next retained bit position.
+
+Eight `clmul32` operations run in pairs. The ninth packs the four masks
+into vector lanes and uses both `UMULL` and `UMULL2`, avoiding duplicate
+work in the spare lane. Key setup precomputes 144 bytes of masked operands,
+which the loop reads each block; the complete key context is 160 bytes.
+Both assembly loops use fixed memory accesses and length-only branches.
+
+The assembled little-endian loops, including input load, byte-order
+conversion, product reconstruction, reduction and loop control, contain:
+
+| Driver | Instructions per 16-byte block | Product multiplies | Reduction multiplies | Key bytes read per block |
+| --- | ---: | --- | --- | ---: |
+| `ghash-neon-orig-pmull13` | 133 | 24 byte PMULL/PMULL2 | 3 byte PMULL/PMULL2 | 0 |
+| `ghash-neon-pmul` | 152 | 24 PMUL | 3 byte PMULL/PMULL2 | 0 |
+| `ghash-neon-umull` | 235 | 72 integer UMULL/UMULL2 | 3 byte PMULL/PMULL2 | 144 |
+
+The zero entries exclude key reads during per-call setup. Each big-endian
+loop has one fewer instruction, omitting the input `REV64`. There are no
+stack spills or helper calls in either new assembly function. Neither
+prototype reduces instruction count. The additional masks, XORs and
+high-product reconstruction outweigh the changes to the multiplies.
+This is a result for these implementations, not a lower bound on all
+possible PMUL or integer-multiply algorithms. Throughput still needs an
+A53 measurement; QEMU TCG timing does not predict it.
+
+Install module release 14 and reload `ghash_neon_shuffle`; `ghash_bench`
+release 2 works unchanged. Compare the existing reducer and both new
+multiplication variants in both orders:
+
+```sh
+rmmod ghash_neon_shuffle
+modprobe ghash_neon_shuffle
+for order in ghash-neon-orig-pmull13,ghash-neon-pmul,ghash-neon-umull \
+             ghash-neon-umull,ghash-neon-pmul,ghash-neon-orig-pmull13; do
+    taskset -c 0 insmod ghash_bench drivers="$order" \
+        lengths=16,32,64,1440,16384,16400,65536 depths=1 \
+        duration_ms=1000 warmup_ms=100 runs=5 || break
+    rmmod ghash_bench || break
+done
+```
+
+Use `drivers=ghash-neon-pmul,ghash-neon-umull lengths=4097 sg_chunk=17`
+with short trials for an additional fragmented-input check. Both variants
+share the existing shash buffering, export/import and 64 KiB SIMD-section
+limit, and remain below stock priorities. They are experiments; the Linux
+`ghash-neon-pmull-reduction` and `ghash-neon-4x` branches are unchanged.
+
+### Release-14 validation
+
+The external module passes ARM64 GCC 14 compilation, modpost and link
+against Linux 6.18.63 with `W=1 KCFLAGS=-Werror`, and strict checkpatch.
+Both assembly files build for big-endian ARM64 as well. Disassembly
+checks confirm the counts above, bounded input/key loads, direct C-wrapper
+calls, no stack spills and unchanged encodings for all thirteen controls
+on both endiannesses. Checks of the disassembled PMUL product pass all
+4096 bilinear basis pairs and 1000 random 64-bit operand pairs. Both UMULL
+helpers match independent carryless multiplication for all 1024 bit-basis
+pairs, 121 dense edge combinations and 4096 random 32-bit operand pairs.
+
+The QEMU TCG Cortex-A53 guest with KASAN and full crypto self-tests passes
+58 benchmark insertions, 2702 rows and 178,476 timed requests. Each new
+driver contributes 1276 rows, covering every byte length 1..257 with three
+seeds, block/page/64 KiB boundaries, SG chunks 1..127 and 1440/1460/4096,
+depths 1/32/128, repeated trials, GCM formatting and module unload/reload.
+The largest formatted input is 69,648 bytes. All fifteen comparison
+drivers report passed crypto self-tests; exact matrices and byte/rate/
+request accounting are checked independently.
+
+Another 18,080 direct-shash comparisons against `ghash-generic` cover
+empty input through 131,201 bytes, four source offsets, four keys including
+all-ones key/data, digest/update/final and export/import/finup at three
+splits. Digest, source and guard checks pass. The guest shuts down without
+warnings, crypto self-test failures or KASAN reports. Big-endian validation
+is build/static only. No OpenWrt package or image was built, and these
+functional checks establish no A53 throughput result.

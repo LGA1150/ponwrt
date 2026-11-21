@@ -82,9 +82,14 @@ byte-PMULL reducer for comparison with the original-loop 15-instruction
 variant. A masked constant places the correction product directly in the
 high two bytes, saving two instructions per block and adding two setup
 instructions per call. The little-endian loop has 133 instructions with
-the original input loads, products and key format. Device performance
-remains to be measured; see the
+the original input loads, products and key format. The A53 comparison
+passes and gains about 0.7% at 1440 through 65536 bytes; see the
 [comparison commands](crypto-ghash-neon-shuffle/README.md#thirteen-instruction-reducer-experiment-release-13).
+Release 14 adds explicitly selected `ghash-neon-pmul` and
+`ghash-neon-umull` multiplication experiments. Their complete loops contain
+152 and 235 instructions per block versus 133 for `orig-pmull13`.
+Neither reduces instruction count; A53 throughput is unmeasured. See the
+[implementation and tests](crypto-ghash-neon-shuffle/README.md#pmul-and-integer-umull-experiments-release-14).
 All previous implementations remain available for comparison.
 Benchmark release 2 recognizes an already registered stock driver without
 loading `ghash-ce.ko`; that package is optional. It supports MSS and full-record

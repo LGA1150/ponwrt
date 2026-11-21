@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=crypto-ghash-neon-shuffle
-PKG_RELEASE:=13
+PKG_RELEASE:=14
 PKG_LICENSE:=GPL-2.0-only
 PKG_BUILD_PARALLEL:=1
 PKG_FILE_DEPENDS:=$(wildcard $(CURDIR)/src/*)
@@ -32,6 +32,8 @@ define KernelPackage/crypto-ghash-neon-shuffle/description
   ghash-neon-2x-load overlaps the remaining key-table loads with multiplication.
   ghash-neon-4x accumulates four blocks before reconstruction and reduction.
   ghash-neon-8x accumulates eight blocks, rereading input instead of spilling.
+  ghash-neon-pmul tests truncated byte polynomial products with bit reversal.
+  ghash-neon-umull tests the generic holes method with integer widening products.
   Coexists with built-in GHASH and needs no kernel or ghash-ce replacement.
   Load explicitly and select the driver by name for measurements.
 endef

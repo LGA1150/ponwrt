@@ -56,6 +56,15 @@ struct ghash_neon_fused_key {
 
 static_assert(offsetof(struct ghash_neon_fused_key, pairs) == GHASH_BLOCK_SIZE);
 
+struct ghash_neon_umull_key {
+	struct ghash_neon_key single;
+	u32 pairs[4][4][2];
+	u32 cross[4];
+};
+
+static_assert(offsetof(struct ghash_neon_umull_key, pairs) == GHASH_BLOCK_SIZE);
+static_assert(offsetof(struct ghash_neon_umull_key, cross) == 144);
+
 struct ghash_neon_desc_ctx {
 	u64 digest[2];
 };
@@ -86,6 +95,11 @@ asmlinkage void ghash_neon_4x_blocks(unsigned int blocks, u64 digest[],
 				     const u8 *src, const u64 h[]);
 asmlinkage void ghash_neon_8x_blocks(unsigned int blocks, u64 digest[],
 				     const u8 *src, const u64 h[]);
+
+asmlinkage void ghash_neon_pmul_blocks(unsigned int blocks, u64 digest[],
+				       const u8 *src, const u64 h[]);
+asmlinkage void ghash_neon_umull_blocks(unsigned int blocks, u64 digest[],
+					const u8 *src, const u64 h[]);
 
 typedef void (*ghash_blocks_fn)(unsigned int blocks, u64 digest[],
 				const u8 *src, const u64 h[]);
@@ -324,6 +338,30 @@ static int ghash_8x_finup(struct shash_desc *desc, const u8 *src,
 	return ghash_do_finup(desc, src, len, dst, ghash_neon_8x_blocks);
 }
 
+static int ghash_pmul_update(struct shash_desc *desc, const u8 *src,
+			     unsigned int len)
+{
+	return ghash_do_update(desc, src, len, ghash_neon_pmul_blocks);
+}
+
+static int ghash_pmul_finup(struct shash_desc *desc, const u8 *src,
+			    unsigned int len, u8 *dst)
+{
+	return ghash_do_finup(desc, src, len, dst, ghash_neon_pmul_blocks);
+}
+
+static int ghash_umull_update(struct shash_desc *desc, const u8 *src,
+			      unsigned int len)
+{
+	return ghash_do_update(desc, src, len, ghash_neon_umull_blocks);
+}
+
+static int ghash_umull_finup(struct shash_desc *desc, const u8 *src,
+			     unsigned int len, u8 *dst)
+{
+	return ghash_do_finup(desc, src, len, dst, ghash_neon_umull_blocks);
+}
+
 static void ghash_reflect(u64 h[2], const u8 *inkey)
 {
 	u64 a, b, carry;
@@ -494,6 +532,43 @@ static int ghash_8x_setkey(struct crypto_shash *tfm, const u8 *inkey,
 	memzero_explicit(reflected, sizeof(reflected));
 	memzero_explicit(&h, sizeof(h));
 	memzero_explicit(&power, sizeof(power));
+	return 0;
+}
+
+static int ghash_umull_setkey(struct crypto_shash *tfm, const u8 *inkey,
+			      unsigned int keylen)
+{
+	struct ghash_neon_umull_key *key = crypto_shash_ctx(tfm);
+	u32 words[4], pairs[5][2];
+	unsigned int i, j, lane;
+
+	if (keylen != GHASH_BLOCK_SIZE)
+		return -EINVAL;
+
+	ghash_reflect(key->single.h, inkey);
+	for (i = 0; i < 4; i++)
+		words[i] = key->single.h[i / 2] >> (32 * (i % 2));
+	pairs[0][0] = words[0];
+	pairs[0][1] = words[1];
+	pairs[1][0] = words[2];
+	pairs[1][1] = words[3];
+	pairs[2][0] = words[0] ^ words[1];
+	pairs[2][1] = words[2] ^ words[3];
+	pairs[3][0] = words[0] ^ words[2];
+	pairs[3][1] = words[1] ^ words[3];
+	pairs[4][0] = pairs[2][0] ^ pairs[2][1];
+	pairs[4][1] = pairs[4][0];
+	for (i = 0; i < ARRAY_SIZE(key->pairs); i++)
+		for (j = 0; j < 4; j++)
+			for (lane = 0; lane < 2; lane++)
+				key->pairs[i][j][lane] = pairs[i][lane] &
+					(0x11111111U << j);
+	for (j = 0; j < 4; j++) {
+		i = (-j) & 3;
+		key->cross[j] = pairs[4][0] & (0x11111111U << i);
+	}
+	memzero_explicit(words, sizeof(words));
+	memzero_explicit(pairs, sizeof(pairs));
 	return 0;
 }
 
@@ -719,6 +794,40 @@ static struct shash_alg ghash_algs[] = {{
 	.import			= ghash_import,
 	.descsize		= sizeof(struct ghash_neon_desc_ctx),
 	.statesize		= sizeof(struct ghash_desc_ctx),
+}, {
+	.base.cra_name		= "ghash",
+	.base.cra_driver_name	= "ghash-neon-pmul",
+	.base.cra_priority	= 86,
+	.base.cra_flags		= CRYPTO_AHASH_ALG_BLOCK_ONLY,
+	.base.cra_blocksize	= GHASH_BLOCK_SIZE,
+	.base.cra_ctxsize	= sizeof(struct ghash_neon_key),
+	.base.cra_module	= THIS_MODULE,
+	.digestsize		= GHASH_DIGEST_SIZE,
+	.init			= ghash_init,
+	.update			= ghash_pmul_update,
+	.finup			= ghash_pmul_finup,
+	.setkey			= ghash_setkey,
+	.export			= ghash_export,
+	.import			= ghash_import,
+	.descsize		= sizeof(struct ghash_neon_desc_ctx),
+	.statesize		= sizeof(struct ghash_desc_ctx),
+}, {
+	.base.cra_name		= "ghash",
+	.base.cra_driver_name	= "ghash-neon-umull",
+	.base.cra_priority	= 85,
+	.base.cra_flags		= CRYPTO_AHASH_ALG_BLOCK_ONLY,
+	.base.cra_blocksize	= GHASH_BLOCK_SIZE,
+	.base.cra_ctxsize	= sizeof(struct ghash_neon_umull_key),
+	.base.cra_module	= THIS_MODULE,
+	.digestsize		= GHASH_DIGEST_SIZE,
+	.init			= ghash_init,
+	.update			= ghash_umull_update,
+	.finup			= ghash_umull_finup,
+	.setkey			= ghash_umull_setkey,
+	.export			= ghash_export,
+	.import			= ghash_import,
+	.descsize		= sizeof(struct ghash_neon_desc_ctx),
+	.statesize		= sizeof(struct ghash_desc_ctx),
 }};
 
 static int __init ghash_neon_shuffle_init(void)
@@ -752,3 +861,5 @@ MODULE_ALIAS_CRYPTO("ghash-neon-2x-load");
 MODULE_ALIAS_CRYPTO("ghash-neon-4x");
 MODULE_ALIAS_CRYPTO("ghash-neon-8x");
 MODULE_ALIAS_CRYPTO("ghash-neon-orig-pmull13");
+MODULE_ALIAS_CRYPTO("ghash-neon-pmul");
+MODULE_ALIAS_CRYPTO("ghash-neon-umull");

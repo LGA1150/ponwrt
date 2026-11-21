@@ -10,7 +10,7 @@ EIP93 registers. The normal EIP93 driver may remain loaded.
 On ARM64 the default driver list is `ghash,ghash-generic,ghash-neon`.
 From release 2 the package selects the separate
 [`kmod-crypto-ghash-neon-shuffle`](../crypto-ghash-neon-shuffle/README.md)
-comparison module on ARM64. Release 13 of that module supplies
+comparison module on ARM64. Release 14 of that module supplies
 `ghash-neon-shuffle`, `ghash-neon-sched`, `ghash-neon-gpr`, `ghash-neon-2x`
 and `ghash-neon-2x-pmull`, plus `ghash-neon-pmull` without aggregation
 and `ghash-neon-orig-pmull` with only the stock loop's reducer changed.
@@ -20,6 +20,8 @@ and `ghash-neon-orig-pmull` with only the stock loop's reducer changed.
 `ghash-neon-4x` accumulates four blocks before reconstruction and reduction.
 `ghash-neon-8x` extends that to eight blocks with three input passes and no spills.
 `ghash-neon-orig-pmull13` tests a 13-instruction reducer in the original loop.
+`ghash-neon-pmul` and `ghash-neon-umull` test byte polynomial and integer
+widening products, respectively, with the same byte-PMULL reducer.
 Select them explicitly alongside `ghash-neon`.
 The default driver list is unchanged.
 On other architectures the default list is `ghash,ghash-generic`.
@@ -165,7 +167,8 @@ This is a separate module with the Crypto API driver names
 and `ghash-neon-2x-pmull`, plus `ghash-neon-pmull`, `ghash-neon-orig-pmull`
 and `ghash-neon-fused`, plus `ghash-neon-2x-reuse`, `ghash-neon-2x-load`
 and `ghash-neon-4x`, plus (module release 12) `ghash-neon-8x` and
-(module release 13) `ghash-neon-orig-pmull13`.
+(module release 13) `ghash-neon-orig-pmull13`, plus (module release 14)
+`ghash-neon-pmul` and `ghash-neon-umull`.
 They can be compared with the built-in `ghash-neon` without rebuilding or
 replacing the kernel. Their priorities are below the stock implementations;
 select the new drivers explicitly. There is no module
@@ -232,7 +235,7 @@ passes short/SG and contiguous checks, gaining 2.8--2.9% over stock for
 1440 through 65536 bytes in both orders (1.2% at 16 bytes). Its bulk medians
 are within 0.07% of the preceding scheduled-PMULL capture; that comparison
 is across captures rather than a direct head-to-head trial. Benchmark
-release 2 works unchanged with all thirteen comparison drivers. It accepts
+release 2 works unchanged with all fifteen comparison drivers. It accepts
 at most eight selected names per insertion, so compare subsets of the
 experimental and stock drivers. The fused variant passes short/SG and contiguous
 checks, but is 1.8% slower at 16 bytes and 7.7--8.1% slower at 1440 through
@@ -247,8 +250,16 @@ a masked constant to place the correction product directly in the high
 two bytes, saving two instructions per block at the cost of two additional
 setup instructions per call. See the
 [13-instruction experiment](../crypto-ghash-neon-shuffle/README.md#thirteen-instruction-reducer-experiment-release-13)
-for short-input checks and measurements in both driver orders. Device
-throughput remains to be measured.
+for short-input checks and measurements in both driver orders. The A53
+device comparison passes and gains approximately 0.7% at 1440 through
+65536 bytes over the 15-instruction reducer.
+
+Module release 14 adds `ghash-neon-pmul` and `ghash-neon-umull`. Their
+complete little-endian loops have 152 and 235 instructions per block,
+versus 133 for `ghash-neon-orig-pmull13`; neither prototype reduces the
+instruction count. See the
+[PMUL/UMULL experiment](../crypto-ghash-neon-shuffle/README.md#pmul-and-integer-umull-experiments-release-14)
+for the arithmetic, validation and device measurement commands.
 
 The release-9 reuse variant alternates low/high/cross and cross/high/low
 product order. It loads 240 key-table bytes for the first pair and 160 for
