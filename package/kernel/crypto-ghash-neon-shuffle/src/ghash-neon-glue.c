@@ -39,6 +39,15 @@ struct ghash_neon_4x_key {
 
 static_assert(offsetof(struct ghash_neon_4x_key, powers) == 256);
 
+struct ghash_neon_8x_key {
+	/* Keep the four-block context for calls and tails below eight blocks. */
+	struct ghash_neon_4x_key tail;
+	/* Low/high/cross; H^8/H^7 through H^2/H; rotations; two lanes. */
+	u64 powers[3][4][5][2];
+};
+
+static_assert(offsetof(struct ghash_neon_8x_key, powers) == 736);
+
 struct ghash_neon_fused_key {
 	struct ghash_neon_key single;
 	/* Low/high product sums; unrotated and four byte rotations; K, H. */
@@ -72,6 +81,8 @@ asmlinkage void ghash_neon_2x_reuse_blocks(unsigned int blocks, u64 digest[],
 asmlinkage void ghash_neon_2x_load_blocks(unsigned int blocks, u64 digest[],
 					  const u8 *src, const u64 h[]);
 asmlinkage void ghash_neon_4x_blocks(unsigned int blocks, u64 digest[],
+				     const u8 *src, const u64 h[]);
+asmlinkage void ghash_neon_8x_blocks(unsigned int blocks, u64 digest[],
 				     const u8 *src, const u64 h[]);
 
 typedef void (*ghash_blocks_fn)(unsigned int blocks, u64 digest[],
@@ -287,6 +298,18 @@ static int ghash_4x_finup(struct shash_desc *desc, const u8 *src,
 	return ghash_do_finup(desc, src, len, dst, ghash_neon_4x_blocks);
 }
 
+static int ghash_8x_update(struct shash_desc *desc, const u8 *src,
+			   unsigned int len)
+{
+	return ghash_do_update(desc, src, len, ghash_neon_8x_blocks);
+}
+
+static int ghash_8x_finup(struct shash_desc *desc, const u8 *src,
+			  unsigned int len, u8 *dst)
+{
+	return ghash_do_finup(desc, src, len, dst, ghash_neon_8x_blocks);
+}
+
 static void ghash_reflect(u64 h[2], const u8 *inkey)
 {
 	u64 a, b, carry;
@@ -420,6 +443,41 @@ static int ghash_4x_setkey(struct crypto_shash *tfm, const u8 *inkey,
 	}
 	memzero_explicit(cubed, sizeof(cubed));
 	memzero_explicit(fourth, sizeof(fourth));
+	memzero_explicit(&h, sizeof(h));
+	memzero_explicit(&power, sizeof(power));
+	return 0;
+}
+
+static int ghash_8x_setkey(struct crypto_shash *tfm, const u8 *inkey,
+			   unsigned int keylen)
+{
+	struct ghash_neon_8x_key *key = crypto_shash_ctx(tfm);
+	unsigned int i, part, rot, pair, lane;
+	u64 reflected[2], value;
+	be128 h, power;
+	int err;
+
+	err = ghash_4x_setkey(tfm, inkey, keylen);
+	if (err)
+		return err;
+
+	memcpy(&h, inkey, sizeof(h));
+	power = h;
+	for (i = 0; i < 8; i++) {
+		if (i)
+			gf128mul_lle(&power, &h);
+		ghash_reflect(reflected, (const u8 *)&power);
+		pair = (7 - i) / 2;
+		lane = (7 - i) % 2;
+		for (part = 0; part < 3; part++) {
+			value = part < 2 ? reflected[part] :
+				reflected[0] ^ reflected[1];
+			for (rot = 0; rot < 5; rot++)
+				key->powers[part][pair][rot][lane] =
+					ror64(value, rot * 8);
+		}
+	}
+	memzero_explicit(reflected, sizeof(reflected));
 	memzero_explicit(&h, sizeof(h));
 	memzero_explicit(&power, sizeof(power));
 	return 0;
@@ -613,6 +671,23 @@ static struct shash_alg ghash_algs[] = {{
 	.import			= ghash_import,
 	.descsize		= sizeof(struct ghash_neon_desc_ctx),
 	.statesize		= sizeof(struct ghash_desc_ctx),
+}, {
+	.base.cra_name		= "ghash",
+	.base.cra_driver_name	= "ghash-neon-8x",
+	.base.cra_priority	= 88,
+	.base.cra_flags		= CRYPTO_AHASH_ALG_BLOCK_ONLY,
+	.base.cra_blocksize	= GHASH_BLOCK_SIZE,
+	.base.cra_ctxsize	= sizeof(struct ghash_neon_8x_key),
+	.base.cra_module	= THIS_MODULE,
+	.digestsize		= GHASH_DIGEST_SIZE,
+	.init			= ghash_init,
+	.update			= ghash_8x_update,
+	.finup			= ghash_8x_finup,
+	.setkey			= ghash_8x_setkey,
+	.export			= ghash_export,
+	.import			= ghash_import,
+	.descsize		= sizeof(struct ghash_neon_desc_ctx),
+	.statesize		= sizeof(struct ghash_desc_ctx),
 }};
 
 static int __init ghash_neon_shuffle_init(void)
@@ -644,3 +719,4 @@ MODULE_ALIAS_CRYPTO("ghash-neon-fused");
 MODULE_ALIAS_CRYPTO("ghash-neon-2x-reuse");
 MODULE_ALIAS_CRYPTO("ghash-neon-2x-load");
 MODULE_ALIAS_CRYPTO("ghash-neon-4x");
+MODULE_ALIAS_CRYPTO("ghash-neon-8x");

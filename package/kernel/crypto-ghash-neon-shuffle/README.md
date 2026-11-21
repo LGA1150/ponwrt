@@ -1,7 +1,7 @@
 # Standalone ARM64 NEON GHASH comparison drivers
 
 `kmod-crypto-ghash-neon-shuffle` supplies `ghash_neon_shuffle.ko` for a
-matching Linux 6.18 kernel. Release 11 registers algorithm `ghash` under eleven
+matching Linux 6.18 kernel. Release 12 registers algorithm `ghash` under twelve
 unique Crypto API driver names:
 
 - **`ghash-neon-shuffle`** retains the release-1 shuffle implementation.
@@ -15,6 +15,7 @@ unique Crypto API driver names:
 - **`ghash-neon-2x-reuse`** reuses the last key table between PMULL block pairs.
 - **`ghash-neon-2x-load`** overlaps the remaining key loads with multiplication.
 - **`ghash-neon-4x`** accumulates four blocks before reconstruction and reduction.
+- **`ghash-neon-8x`** accumulates eight blocks, rereading input to avoid spills.
 
 Each name always selects its own implementation; there is no switching parameter.
 
@@ -28,11 +29,11 @@ extension, although the stock Linux 6.18 driver does not register standalone
 `ghash-neon` on those CPUs.
 
 Priorities 99 (shuffle), 98 (sched), 97 (gpr), 96 (2x), 95 (2x-pmull),
-94 (pmull), 93 (orig-pmull), 92 (fused), 91 (2x-reuse), 90 (2x-load) and
-89 (4x) are below stock
+94 (pmull), 93 (orig-pmull), 92 (fused), 91 (2x-reuse), 90 (2x-load),
+89 (4x) and 88 (8x) are below stock
 `ghash-neon` (150) and `ghash-generic` (100), so
 stock implementations win selection by `ghash`. Select the experimental drivers explicitly.
-Crypto API module aliases cover only these eleven unique names. The package has no
+Crypto API module aliases cover only these twelve unique names. The package has no
 autoload or conflict entry and does not change `CONFIG_CRYPTO_GHASH_ARM64_CE`.
 
 ## Build and load
@@ -1192,6 +1193,121 @@ Cortex-A53 scheduling or throughput; device measurements above establish
 performance. This guest run is little-endian; big-endian coverage remains
 the assembly build and static analysis.
 
+## Eight-block aggregation experiment (release 12)
+
+`ghash-neon-8x` evaluates
+
+```text
+(Y XOR X1) * H^8 XOR X2 * H^7 XOR ... XOR X8 * H
+```
+
+with one field reduction for all eight input blocks. For each low, high
+and cross Karatsuba part, it accumulates eight 64-by-64-bit products in
+the unreconstructed byte-product registers, then reconstructs their sum
+once. The three parts share the existing join and byte-PMULL reducer.
+This uses 195 byte PMULLs and three reconstructions per eight blocks,
+compared with 198 byte PMULLs and six reconstructions for two four-block
+groups.
+
+The four-block loop already uses all 32 vector registers. The eight-block
+variant keeps the incoming accumulator in `SHASH2`, loads two input blocks
+at a time with `LD2`, and makes three passes over each 128-byte input span.
+It selects the low, high or cross operands during that pass and folds the
+incoming accumulator into the first block only. No assembly stack spills
+are needed. All three passes stay within the same supplied eight blocks;
+there is no speculative load beyond the input.
+
+Key setup retains the complete four-block context as a prefix and adds
+powers through H^8. Twelve 80-byte tables contain the low/high/cross parts
+of H^8/H^7, H^6/H^5, H^4/H^3 and H^2/H. Traversal alternates forwards and
+backwards, retaining the last table and overlapping subsequent key loads
+with multiplication. Key context size is 1696 bytes versus 736 for 4x.
+Calls and tails below eight blocks branch to the unchanged four-block
+implementation, including its two- and single-block tails.
+
+The little-endian forward/reverse bodies contain 712/723 instructions;
+the two four-block bodies together contain 747. The eight-block path reads
+384 input bytes per 128-byte group and `80 + 880*n` key-table bytes for
+`n` groups. Two four-block groups read 128 input bytes and consume 800
+key-table bytes in steady state. The device results below show lower
+throughput for 128--1440-byte inputs and effectively tied bulk throughput.
+The driver remains an explicit, low-priority comparison; 4x remains the
+preferred implementation.
+
+After installing release 12, unload any benchmark instance, reload
+`ghash_neon_shuffle`, and run the short/boundary check:
+
+```sh
+insmod ghash_bench drivers=ghash-neon-4x,ghash-neon-8x \
+    lengths=1,15,16,17,63,64,65,111,112,113,127,128,129,143,144,145,239,240,241,255,256,257,4097,65535,65536 \
+    depths=1,32 duration_ms=10 warmup_ms=0 runs=1
+rmmod ghash_bench
+```
+
+Then compare both orders on the same CPU:
+
+```sh
+for order in ghash-neon-4x,ghash-neon-8x ghash-neon-8x,ghash-neon-4x; do
+    taskset -c 0 insmod ghash_bench drivers="$order" \
+        lengths=16,64,112,128,144,192,256,1440,16384,16400,65536 depths=1 \
+        duration_ms=1000 warmup_ms=100 runs=5 || break
+    rmmod ghash_bench || break
+done
+```
+
+128 bytes is the first complete eight-block group, 144 adds a single-block
+tail, 192 adds a four-block tail, and 256 exercises both traversal phases.
+For fragmented checks, repeat with `lengths=4097 sg_chunk=17` and
+`sg_chunk=127`, and with `lengths=16384,16400,65536 sg_chunk=1440`.
+GCM-formatted checks can use `aad_len=13 lengths=1,111,112,113,127,128,129,16384,65536`.
+Use multiple seeds as for the earlier variants. Source/digest guards and
+reference digests must pass before interpreting rates.
+
+### Eight-block device comparison
+
+The supplied Cortex-A53 capture passes 220 rows and 123,849,377 timed
+requests across both driver orders. Each order uses seed 1708171853,
+raw single-entry input, depth 1, five one-second trials and a 100 ms
+warmup. Requested and selected driver names match throughout. Medians
+recomputed from byte counts and elapsed time are:
+
+| Input bytes | 4x Gbit/s, 4x first | 8x Gbit/s, 4x first | 8x change | 4x Gbit/s, 8x first | 8x Gbit/s, 8x first | 8x change |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 0.174570 | 0.173984 | -0.336% | 0.173012 | 0.172495 | -0.299% |
+| 64 | 0.566883 | 0.567270 | +0.068% | 0.561666 | 0.563939 | +0.405% |
+| 112 | 0.707754 | 0.707409 | -0.049% | 0.702678 | 0.704247 | +0.223% |
+| 128 | 0.866641 | 0.823028 | -5.032% | 0.859737 | 0.820087 | -4.612% |
+| 144 | 0.861528 | 0.820380 | -4.776% | 0.855647 | 0.817228 | -4.490% |
+| 192 | 1.052968 | 0.973264 | -7.569% | 1.046950 | 0.970891 | -7.265% |
+| 256 | 1.178032 | 1.134007 | -3.737% | 1.172574 | 1.131227 | -3.526% |
+| 1440 | 1.653960 | 1.639256 | -0.889% | 1.652120 | 1.638360 | -0.833% |
+| 16384 | 1.823361 | 1.823143 | -0.012% | 1.823204 | 1.822648 | -0.030% |
+| 16400 | 1.820322 | 1.819202 | -0.062% | 1.820433 | 1.820200 | -0.013% |
+| 65536 | 1.823936 | 1.824981 | +0.057% | 1.822772 | 1.823535 | +0.042% |
+
+At each tested length from 128 through 1440 bytes, every four-block trial
+is faster than every eight-block trial in the same order. The 16--64 KiB
+medians differ by less than 0.07%, and the reversed-order trial ranges
+overlap at all three bulk lengths. This establishes no useful bulk gain
+from the extra aggregation. The sub-128-byte cases take the existing
+four-block/tail path and do not measure the new eight-block body.
+
+The extra input passes, ten percent more steady-state key-table bytes,
+and separate four-block setup for tails are plausible costs despite
+fewer arithmetic instructions. The largest regression is at 192 bytes,
+which processes one eight-block group and then enters the four-block
+tail path. These timings do not isolate load, issue or tail-setup costs;
+they are not evidence of a DRAM bandwidth limit. Retain 4x as the preferred
+implementation and keep 8x as an explicitly selected experiment.
+
+The exact matrix, byte/time/rate accounting and request totals pass
+independent analysis. Verification covers preflight, final-slot digests
+and source/digest guards; intermediate timed digests are reused. This
+capture uses one seed and block-multiple lengths with contiguous input.
+It does not add device partial-block/SG/GCM checks or establish full
+GCM/kTLS throughput. No implementation or package-release change was
+needed to record these results, and no build/runtime test was rerun.
+
 ## Four-block validation (release 11)
 
 The ARM64 GCC 14 module build against Linux 6.18.63 passes with
@@ -1226,3 +1342,39 @@ and guards pass. The guest shuts down without KASAN reports, warnings or
 crypto self-test failures. No driver fixes were needed during validation.
 QEMU rates are not A53 performance measurements. Big-endian validation
 remains build/static only; no OpenWrt package/image was built.
+
+## Eight-block validation (release 12)
+
+The ARM64 GCC 14 module build against Linux 6.18.63 passes with
+`W=1 KCFLAGS=-Werror`, including modpost/link. Strict checkpatch and a
+separate big-endian assembly build pass. All eleven earlier assembly
+functions retain their instruction encodings on both endiannesses.
+Symbolic checks prove the eight-term product sums for arbitrary operands,
+including input packing, the incoming accumulator, and preserved live
+registers. The join and reducer match the previously tested pair path.
+Compiled control-flow analysis checks 271 block counts through 4096 on
+each endianness, including every count 1..257. It follows every key lane,
+checks bounded input/table reads, all tails modulo eight, one reduction per
+group, and exactly `80 + 880*n` key-table bytes for `n` complete groups.
+There are no assembly stack accesses or 64-bit PMULL instructions, and
+all twelve C wrappers call assembly directly.
+
+The QEMU TCG Cortex-A53 guest with KASAN and full crypto self-tests enabled
+passes 57 benchmark insertions, 1430 rows and 89,120 timed requests. All
+twelve comparison drivers report `selftest: passed`. The eight-block
+driver passes every byte length 1..257 with three seeds, block/page/64 KiB
+boundaries, SG chunks 1..127 and 1440/1460/4096 bytes, request depths
+1/32/128, repeated trials, GCM formatting and unload/reload. The maximum
+formatted input is 69,648 bytes. The exact matrices, selected drivers,
+byte counts, rates and request totals are independently checked.
+
+Direct shash calls add 13,560 comparisons against `ghash-generic`: 6780
+each for `ghash-neon-4x` and `ghash-neon-8x`. These cover 113 lengths from
+empty input through 131,201 bytes, four source offsets, three keys,
+whole-buffer digest/update/final, and export/import/finup at three splits.
+They cover every full-block tail modulo eight and direct calls spanning
+one and two internal 64 KiB boundaries. Reference digests, source contents
+and guards pass. The guest shuts down without KASAN reports, warnings or
+crypto self-test failures. QEMU rates do not establish A53 performance;
+big-endian validation remains build/static only. No OpenWrt package/image
+was built.

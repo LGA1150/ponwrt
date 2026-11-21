@@ -727,9 +727,10 @@ SYM_FUNC_END(ghash_neon_2x_load_blocks)
 	 * Add two more 64x64 products to the unreconstructed t3/t5/t7/t9/rq
 	 * terms left by __pmull_2x_p8. Only t4/t6/t8 and ss1..ss4 are scratch:
 	 * the other six data registers hold inputs or completed products.
-	 * Reconstruct once, after all four products have been accumulated.
+	 * Reconstruct once after the last pair; combine=0 retains the raw sum
+	 * so the eight-block path can accumulate further pairs.
 	 */
-	.macro		__pmull_4x_acc_p8, rq, ad, next_key=0
+	.macro		__pmull_4x_acc_p8, rq, ad, next_key=0, combine=1
 	tbl		ss1.16b, {\ad\().16b}, perm1.16b
 	.if		\next_key
 	ldr		x6, [x4]
@@ -799,7 +800,9 @@ SYM_FUNC_END(ghash_neon_2x_load_blocks)
 	eor		t7.16b, t7.16b, t4.16b
 	eor		t9.16b, t9.16b, ss1.16b
 	eor		\rq\().16b, \rq\().16b, t6.16b
+	.if		\combine
 	__pmull_p8_combine \rq
+	.endif
 	.endm
 
 	/* (Y ^ X1)*H^4 ^ X2*H^3 ^ X3*H^2 ^ X4*H, reduced once. */
@@ -878,6 +881,104 @@ SYM_FUNC_START(ghash_neon_4x_blocks)
 	cbnz		w0, ghash_neon_2x_load_blocks
 	ret
 SYM_FUNC_END(ghash_neon_4x_blocks)
+
+	/*
+	 * LD2 packs the native-endian high and low halves of two GHASH blocks
+	 * into T1 and T2. Select one Karatsuba operand pair, then reflect it.
+	 * SHASH2 holds Y until all three unreduced products are complete.
+	 */
+	.macro		__ghash_8x_input, part, first=0, reverse=0
+	.if		\reverse
+	ld2		{T1.2d, T2.2d}, [x15], x16
+	.else
+	ld2		{T1.2d, T2.2d}, [x15], #32
+	.endif
+	.if		\part == 0
+	mov		T1.16b, T2.16b
+	.elseif		\part == 2
+	eor		T1.16b, T1.16b, T2.16b
+	.endif
+CPU_LE(	rev64		T1.16b, T1.16b	)
+	.if		\first
+	.if		\part == 2
+	ext		NEXT.16b, SHASH2.16b, SHASH2.16b, #8
+	eor		NEXT.8b, NEXT.8b, SHASH2.8b
+	.else
+	/* Scalar DUP clears the upper lane, leaving X2 unchanged. */
+	dup		d4, SHASH2.d[\part]
+	.endif
+	eor		T1.16b, T1.16b, NEXT.16b
+	.endif
+	.endm
+
+	/* Accumulate eight 64x64 products, then reconstruct their sum once. */
+	.macro		__ghash_8x_part, rq, part, reverse=0, next_part=1
+	.if		\reverse
+	add		x15, x2, #96
+	.else
+	mov		x15, x2
+	.endif
+	__ghash_8x_input \part, (1 - \reverse), \reverse
+	.if		\reverse
+	sub		x4, x4, #160
+	.endif
+	__pmull_2x_p8	\rq, T1, 0, 1, 0
+	.rept		2
+	__ghash_8x_input \part, 0, \reverse
+	.if		\reverse
+	sub		x4, x4, #160
+	.endif
+	__pmull_4x_acc_p8 \rq, T1, 1, 0
+	.endr
+	__ghash_8x_input \part, \reverse, \reverse
+	.if		\reverse && \next_part
+	sub		x4, x4, #160
+	.endif
+	__pmull_4x_acc_p8 \rq, T1, \next_part
+	.endm
+
+	/* (Y ^ X1)*H^8 ^ X2*H^7 ^ ... ^ X8*H, reduced once. */
+	.macro		__ghash_8x_step, reverse=0
+	mov		SHASH2.16b, XL.16b
+	.if		\reverse
+	__ghash_8x_part	XM, 2, 1
+	__ghash_8x_part	XH, 1, 1
+	__ghash_8x_part	XL, 0, 1, 0
+	.else
+	__ghash_8x_part	XL, 0
+	__ghash_8x_part	XH, 1
+	__ghash_8x_part	XM, 2, 0, 0
+	.endif
+	eor		T2.16b, XL.16b, XH.16b
+	ext		T1.16b, XL.16b, XH.16b, #8
+	eor		XM.16b, XM.16b, T2.16b
+	movi		SHASH2.16b, #0xc2
+	__pmull_reduce_p8_mul
+	add		x2, x2, #128
+	sub		w0, w0, #8
+	cmp		w0, #8
+	.endm
+
+SYM_FUNC_START(ghash_neon_8x_blocks)
+	cmp		w0, #8
+	b.lo		ghash_neon_4x_blocks
+	ld1		{XL.2d}, [x1]
+	__pmull_pre_p8 0
+	/* Keep the four-block key/context prefix for the one-to-seven tail. */
+	add		x4, x3, #736
+	mov		x16, #-32
+	ld1		{SHASH.2d}, [x4], #16
+	ld1		{sh1.2d-sh4.2d}, [x4], #64
+1:
+	__ghash_8x_step
+	b.lo		2f
+	__ghash_8x_step 1
+	b.hs		1b
+2:
+	st1		{XL.2d}, [x1]
+	cbnz		w0, ghash_neon_4x_blocks
+	ret
+SYM_FUNC_END(ghash_neon_8x_blocks)
 
 	.section	".rodata", "a"
 	.align		6

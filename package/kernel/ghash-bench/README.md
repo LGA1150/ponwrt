@@ -10,7 +10,7 @@ EIP93 registers. The normal EIP93 driver may remain loaded.
 On ARM64 the default driver list is `ghash,ghash-generic,ghash-neon`.
 From release 2 the package selects the separate
 [`kmod-crypto-ghash-neon-shuffle`](../crypto-ghash-neon-shuffle/README.md)
-comparison module on ARM64. Release 11 of that module supplies
+comparison module on ARM64. Release 12 of that module supplies
 `ghash-neon-shuffle`, `ghash-neon-sched`, `ghash-neon-gpr`, `ghash-neon-2x`
 and `ghash-neon-2x-pmull`, plus `ghash-neon-pmull` without aggregation
 and `ghash-neon-orig-pmull` with only the stock loop's reducer changed.
@@ -18,6 +18,7 @@ and `ghash-neon-orig-pmull` with only the stock loop's reducer changed.
 `ghash-neon-2x-reuse` retains the last key table between PMULL block pairs.
 `ghash-neon-2x-load` also overlaps remaining key loads with multiplication.
 `ghash-neon-4x` accumulates four blocks before reconstruction and reduction.
+`ghash-neon-8x` extends that to eight blocks with three input passes and no spills.
 Select them explicitly alongside `ghash-neon`.
 The default driver list is unchanged.
 On other architectures the default list is `ghash,ghash-generic`.
@@ -162,7 +163,7 @@ This is a separate module with the Crypto API driver names
 `ghash-neon-shuffle`, `ghash-neon-sched`, `ghash-neon-gpr`, `ghash-neon-2x`
 and `ghash-neon-2x-pmull`, plus `ghash-neon-pmull`, `ghash-neon-orig-pmull`
 and `ghash-neon-fused`, plus `ghash-neon-2x-reuse`, `ghash-neon-2x-load`
-and (module release 11) `ghash-neon-4x`.
+and `ghash-neon-4x`, plus (module release 12) `ghash-neon-8x`.
 They can be compared with the built-in `ghash-neon` without rebuilding or
 replacing the kernel. Their priorities are below the stock implementations;
 select the new drivers explicitly. There is no module
@@ -171,8 +172,8 @@ parameter to switch implementations.
 ```sh
 modprobe ghash_neon_shuffle
 taskset -c 0 insmod ghash_bench \
-    drivers=ghash-neon-2x-load,ghash-neon-4x \
-    lengths=16,32,64,96,128,1440,16384,16400,65536 depths=1 \
+    drivers=ghash-neon-4x,ghash-neon-8x \
+    lengths=16,64,112,128,144,192,256,1440,16384,16400,65536 depths=1 \
     duration_ms=1000 warmup_ms=100 runs=5
 rmmod ghash_bench
 ```
@@ -182,7 +183,7 @@ Use benchmark release 2 to recognize built-in stock GHASH without requiring
 The CSV labels each implementation independently. The
 [standalone module README](../crypto-ghash-neon-shuffle/README.md) describes
 block-boundary and SG checks, the shuffle rewrite, scheduling, GPR-load,
-two/four-block aggregation, byte-PMULL reduction, folded-key, key-table reuse and
+two/four/eight-block aggregation, byte-PMULL reduction, folded-key, key-table reuse and
 key-load scheduling experiments, and validation. The
 `ghash-neon-2x-load` keeps the reuse variant's arithmetic and table traffic,
 staging part of the next table through six GPRs during the current multiply.
@@ -203,6 +204,18 @@ gains 19.3% at 1440 bytes and about 22.5% at 16384 through 65536 bytes in
 both orders, reaching 1.823721 Gbit/s at 64 KiB. It is now the fastest measured
 bulk variant. The capture covers raw single-entry input and one seed;
 intermediate digests are reused, and complete GCM/kTLS is not measured.
+Release 12 adds the eight-block comparison, sharing one reduction and three
+reconstructions across eight blocks. It rereads input for each Karatsuba
+part to avoid spills, and uses the unchanged four-block path for short
+calls/tails. The device comparison passes 220 rows and 123,849,377 timed
+requests, but 8x is 3.5--7.6% slower at 128--256 bytes and 0.8--0.9%
+slower at 1440 bytes in both orders. The 16--64 KiB medians differ by
+less than 0.07%; there is no useful bulk gain. Keep 4x as the preferred
+implementation. The capture uses one seed and raw, contiguous input,
+with reference/final-slot and guard checks and intermediate digests reused.
+See the
+[eight-block experiment](../crypto-ghash-neon-shuffle/README.md#eight-block-aggregation-experiment-release-12)
+for the tradeoffs and commands.
 Run the short/SG and GCM-boundary checks in the standalone module README
 before the timed comparison above. Device comparisons show no measurable
 gain for the shuffle-only variant, and a repeatable gain of about 0.7% for
@@ -217,7 +230,7 @@ passes short/SG and contiguous checks, gaining 2.8--2.9% over stock for
 1440 through 65536 bytes in both orders (1.2% at 16 bytes). Its bulk medians
 are within 0.07% of the preceding scheduled-PMULL capture; that comparison
 is across captures rather than a direct head-to-head trial. Benchmark
-release 2 works unchanged with all eleven comparison drivers. It accepts
+release 2 works unchanged with all twelve comparison drivers. It accepts
 at most eight selected names per insertion, so compare subsets of the
 experimental and stock drivers. The fused variant passes short/SG and contiguous
 checks, but is 1.8% slower at 16 bytes and 7.7--8.1% slower at 1440 through

@@ -67,6 +67,16 @@ rises from 1.488876 to 1.823721 Gbit/s, making four-block aggregation the
 fastest measured bulk variant. This capture uses raw single-entry input and
 one seed; reference/final-slot and guard checks pass, with intermediate
 digests reused. It does not measure complete GCM or kTLS performance.
+Release 12 adds `ghash-neon-8x`, accumulating eight blocks before the same
+three product reconstructions and one reduction. It uses three input passes
+to avoid assembly spills, precomputes powers through H^8, and uses the
+four-block implementation for short calls and tails. Its 1696-byte key
+context and extra input/key loads yield no useful bulk gain in the device
+comparison: 220 rows and 123,849,377 timed requests pass, but 8x is
+3.5--7.6% slower at 128--256 bytes and 0.8--0.9% slower at 1440 bytes in
+both orders. The 16--64 KiB medians are within 0.07% of 4x. Keep 4x as
+the preferred implementation; the capture has the same verification
+limits as the four-block measurements above.
 All previous implementations remain available for comparison.
 Benchmark release 2 recognizes an already registered stock driver without
 loading `ghash-ce.ko`; that package is optional. It supports MSS and full-record
