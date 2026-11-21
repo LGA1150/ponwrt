@@ -85,6 +85,8 @@ asmlinkage void ghash_neon_orig_pmull_blocks(unsigned int blocks, u64 digest[],
 					     const u8 *src, const u64 h[]);
 asmlinkage void ghash_neon_orig_pmull13_blocks(unsigned int blocks, u64 digest[],
 					       const u8 *src, const u64 h[]);
+asmlinkage void ghash_neon_orig_pmull12_blocks(unsigned int blocks, u64 digest[],
+					       const u8 *src, const u64 h[]);
 asmlinkage void ghash_neon_fused_blocks(unsigned int blocks, u64 digest[],
 					const u8 *src, const u64 h[]);
 asmlinkage void ghash_neon_2x_reuse_blocks(unsigned int blocks, u64 digest[],
@@ -276,6 +278,18 @@ static int ghash_orig_pmull13_finup(struct shash_desc *desc, const u8 *src,
 				    unsigned int len, u8 *dst)
 {
 	return ghash_do_finup(desc, src, len, dst, ghash_neon_orig_pmull13_blocks);
+}
+
+static int ghash_orig_pmull12_update(struct shash_desc *desc, const u8 *src,
+				     unsigned int len)
+{
+	return ghash_do_update(desc, src, len, ghash_neon_orig_pmull12_blocks);
+}
+
+static int ghash_orig_pmull12_finup(struct shash_desc *desc, const u8 *src,
+				    unsigned int len, u8 *dst)
+{
+	return ghash_do_finup(desc, src, len, dst, ghash_neon_orig_pmull12_blocks);
 }
 
 static int ghash_fused_update(struct shash_desc *desc, const u8 *src,
@@ -828,6 +842,23 @@ static struct shash_alg ghash_algs[] = {{
 	.import			= ghash_import,
 	.descsize		= sizeof(struct ghash_neon_desc_ctx),
 	.statesize		= sizeof(struct ghash_desc_ctx),
+}, {
+	.base.cra_name		= "ghash",
+	.base.cra_driver_name	= "ghash-neon-orig-pmull12",
+	.base.cra_priority	= 84,
+	.base.cra_flags		= CRYPTO_AHASH_ALG_BLOCK_ONLY,
+	.base.cra_blocksize	= GHASH_BLOCK_SIZE,
+	.base.cra_ctxsize	= sizeof(struct ghash_neon_key),
+	.base.cra_module	= THIS_MODULE,
+	.digestsize		= GHASH_DIGEST_SIZE,
+	.init			= ghash_init,
+	.update			= ghash_orig_pmull12_update,
+	.finup			= ghash_orig_pmull12_finup,
+	.setkey			= ghash_setkey,
+	.export			= ghash_export,
+	.import			= ghash_import,
+	.descsize		= sizeof(struct ghash_neon_desc_ctx),
+	.statesize		= sizeof(struct ghash_desc_ctx),
 }};
 
 static int __init ghash_neon_shuffle_init(void)
@@ -863,3 +894,4 @@ MODULE_ALIAS_CRYPTO("ghash-neon-8x");
 MODULE_ALIAS_CRYPTO("ghash-neon-orig-pmull13");
 MODULE_ALIAS_CRYPTO("ghash-neon-pmul");
 MODULE_ALIAS_CRYPTO("ghash-neon-umull");
+MODULE_ALIAS_CRYPTO("ghash-neon-orig-pmull12");

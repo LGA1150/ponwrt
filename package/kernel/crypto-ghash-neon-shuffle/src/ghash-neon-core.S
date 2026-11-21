@@ -50,6 +50,7 @@
 	pack4		.req	v31
 	REDUCE_CONST	.req	v28	// free in the original, unfused loop
 	REDUCE_LAST	.req	v29
+	REDUCE_PERM	.req	v30
 
 	.text
 	.arch		armv8-a
@@ -494,7 +495,7 @@ SYM_FUNC_END(ghash_neon_gpr_blocks)
 	 * scheduled single-block loops prepare T2 after their Karatsuba products.
 	 * The original loop keeps the constant in otherwise unused v28.
 	 */
-	.macro		__pmull_reduce_p8_mul, c=SHASH2, masked=0
+	.macro		__pmull_reduce_p8_mul, c=SHASH2, masked=0, permute=0
 	eor		XM.16b, XM.16b, T1.16b
 	zip1		XL.2d, XL.2d, XM.2d
 	zip2		XH.2d, XM.2d, XH.2d
@@ -502,10 +503,16 @@ SYM_FUNC_END(ghash_neon_gpr_blocks)
 	pmull		t3.8h, XL.8b, \c\().8b
 	pmull2		t4.8h, XL.16b, \c\().16b
 	eor		XH.16b, XH.16b, XL.16b
+	.if		\permute
+	tbl		t5.16b, {t3.16b, t4.16b}, REDUCE_PERM.16b
+	.else
 	uzp1		t5.16b, t3.16b, t4.16b
+	.endif
 	uzp2		t6.16b, t3.16b, t4.16b
 	.if		\masked
+	.if		!\permute
 	ext		t5.16b, t5.16b, t5.16b, #1
+	.endif
 	pmull2		t7.8h, t5.16b, REDUCE_LAST.16b
 	.else
 	pmull		t7.8h, t5.8b, \c\().8b
@@ -578,7 +585,7 @@ SYM_FUNC_START(ghash_neon_pmull_blocks)
 SYM_FUNC_END(ghash_neon_pmull_blocks)
 
 	/* Stock p8 input loads, products and shuffles; change only reduction. */
-	.macro		__ghash_orig_pmull, masked=0
+	.macro		__ghash_orig_pmull, masked=0, permute=0
 	ld1		{SHASH.2d}, [x3]
 	ld1		{XL.2d}, [x1]
 	__pmull_pre_p8 1, 1
@@ -587,6 +594,10 @@ SYM_FUNC_END(ghash_neon_pmull_blocks)
 	.if		\masked
 	movi		REDUCE_LAST.16b, #0
 	mov		REDUCE_LAST.b[15], REDUCE_CONST.b[0]
+	.endif
+	.if		\permute
+	adr_l		x5, .Lghash_neon_reduce_perm
+	ld1		{REDUCE_PERM.16b}, [x5]
 	.endif
 
 .Lghash_orig_pmull_loop\@:
@@ -607,7 +618,7 @@ CPU_LE(	rev64		T1.16b, T1.16b	)
 	eor		T2.16b, XL.16b, XH.16b
 	ext		T1.16b, XL.16b, XH.16b, #8
 	eor		XM.16b, XM.16b, T2.16b
-	__pmull_reduce_p8_mul REDUCE_CONST, \masked
+	__pmull_reduce_p8_mul REDUCE_CONST, \masked, \permute
 	cbnz		w0, .Lghash_orig_pmull_loop\@
 
 	st1		{XL.2d}, [x1]
@@ -621,6 +632,10 @@ SYM_FUNC_END(ghash_neon_orig_pmull_blocks)
 SYM_FUNC_START(ghash_neon_orig_pmull13_blocks)
 	__ghash_orig_pmull 1
 SYM_FUNC_END(ghash_neon_orig_pmull13_blocks)
+
+SYM_FUNC_START(ghash_neon_orig_pmull12_blocks)
+	__ghash_orig_pmull 1, 1
+SYM_FUNC_END(ghash_neon_orig_pmull12_blocks)
 
 	/*
 	 * Fold the first Montgomery step into the fixed key at setkey().
@@ -1015,3 +1030,7 @@ SYM_FUNC_END(ghash_neon_8x_blocks)
 	/* {t6, t7}: ZIP2(t6, t7), then rotate left by four bytes. */
 	.byte		28, 29, 30, 31, 8, 9, 10, 11
 	.byte		12, 13, 14, 15, 24, 25, 26, 27
+
+.Lghash_neon_reduce_perm:
+	.byte		2, 4, 6, 8, 10, 12, 14, 16
+	.byte		18, 20, 22, 24, 26, 28, 30, 0

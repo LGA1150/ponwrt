@@ -88,8 +88,14 @@ passes and gains about 0.7% at 1440 through 65536 bytes; see the
 Release 14 adds explicitly selected `ghash-neon-pmul` and
 `ghash-neon-umull` multiplication experiments. Their complete loops contain
 152 and 235 instructions per block versus 133 for `orig-pmull13`.
-Neither reduces instruction count; A53 throughput is unmeasured. See the
+Both pass the A53 digest/guard checks but lose 17.5% and 62.5% throughput
+at 64 KiB relative to `orig-pmull13`. See the
 [implementation and tests](crypto-ghash-neon-shuffle/README.md#pmul-and-integer-umull-experiments-release-14).
+Release 15 adds `ghash-neon-orig-pmull12`, combining low-byte extraction
+and rotation with one two-register `TBL`. Its complete loop has 132
+instructions, with three additional setup instructions and one 16-byte
+constant load per call. A53 throughput is not yet measured. See the
+[comparison commands](crypto-ghash-neon-shuffle/README.md#twelve-instruction-reducer-experiment-release-15).
 All previous implementations remain available for comparison.
 Benchmark release 2 recognizes an already registered stock driver without
 loading `ghash-ce.ko`; that package is optional. It supports MSS and full-record
