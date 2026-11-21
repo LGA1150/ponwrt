@@ -1,0 +1,125 @@
+From 4e60e8f03184a32e63b00a939458ed8f302aae52 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 19:32:37 +0800
+Subject: [PATCH] crypto: eip93 - read authenc tags from saved hash state
+
+On Airoha, SHA256/RFC3686 authenc intermittently corrupts one output tag
+byte for a 1025-byte payload with 13 bytes of AAD. Hardware reports success
+and a 1070-byte output. The direct test isolates tag byte 29: 0x29 becomes
+0xa8, the value of neighboring byte 28, while all other output bytes match.
+Valid decryption can consequently fail the host tag comparison too.
+
+Enable SAVE_HASH and disable COPY_DIGEST for authenc, obtaining the digest
+from aligned per-request SA state instead of the packet tail. This uses
+the documented hash-state save mechanism already used by the hash/HMAC
+driver. Unmap the state before reading it, normalize SHA digest words,
+and append encryption tags on the CPU or compare decryption tags with
+crypto_memneq(). Keep decrypted data private until authentication passes.
+Cipher and HMAC calculation remain on hardware.
+
+Move IV and CTR-wrap state unmapping into the common DMA cleanup so that
+state is CPU-owned before tag handling. The existing completion helper
+still copies the final IV and frees state. Hardware error propagation,
+alignment checks, burst configuration and fallback limits are unchanged.
+
+This avoids the packet-tag output path; the underlying hardware fault
+and effectiveness on Airoha still need device confirmation.
+
+Host GCC 14.2 W=1 builds the full module. A QEMU software model reproduces
+the exact packet-tag byte duplication before this change and passes the
+existing test module's 12,824 authenc cases after it. The model withholds
+device-written state until unmap, checks ECB/CBC/CTR cleanup on success
+and failure, and confirms that injected data, digest and hardware errors
+are still detected. These checks do not emulate physical EIP93 DMA.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-aead.c   |  3 +++
+ eip93-common.c | 28 ++++++++++++++--------------
+ 2 files changed, 17 insertions(+), 14 deletions(-)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 1aa7a5e..fdc9ace 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -148,6 +148,9 @@ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+ 	sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_DIGEST_LENGTH;
+ 	sa_record->sa_cmd0_word |= FIELD_PREP(EIP93_SA_CMD_DIGEST_LENGTH,
+ 					      ctx->authsize / sizeof(u32));
++	/* Fetch the digest from aligned state, not the packet's byte tail. */
++	sa_record->sa_cmd0_word |= EIP93_SA_CMD_SAVE_HASH;
++	sa_record->sa_cmd1_word &= ~EIP93_SA_CMD_COPY_DIGEST;
+ 
+ 	memcpy(sa_record->sa_key, keys.enckey, keys.enckeylen);
+ 	ctx->sa_nonce = nonce;
+diff --git a/eip93-common.c b/eip93-common.c
+index 6cc4749..e724ac5 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -317,7 +317,7 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 			dst_align = eip93_is_sg_aligned(dst, totlen_dst, blksize, true);
+ 	}
+ 
+-	/* Basic hash-decrypt writes a digest; it does not verify the input tag. */
++	/* Keep the input tag and hold decrypted data until authentication. */
+ 	if (authsize && IS_DECRYPT(rctx->flags))
+ 		dst_align = false;
+ 
+@@ -736,7 +736,7 @@ int eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx
+ 	if (rctx->sg_src == rctx->sg_dst) {
+ 		dma_unmap_sg(eip93->dev, rctx->sg_dst, rctx->dst_nents,
+ 			     DMA_BIDIRECTIONAL);
+-		goto process_tag;
++		goto unmap_state;
+ 	}
+ 
+ 	dma_unmap_sg(eip93->dev, rctx->sg_src, rctx->src_nents,
+@@ -745,9 +745,16 @@ int eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx
+ 	dma_unmap_sg(eip93->dev, rctx->sg_dst, rctx->dst_nents,
+ 		     DMA_BIDIRECTIONAL);
+ 
+-process_tag:
++unmap_state:
++	if (rctx->sa_state_ctr)
++		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
++				 sizeof(*rctx->sa_state_ctr), DMA_BIDIRECTIONAL);
++	if (rctx->sa_state)
++		dma_unmap_single(eip93->dev, rctx->sa_state_base,
++				 sizeof(*rctx->sa_state), DMA_BIDIRECTIONAL);
++
+ 	if (!err && authsize) {
+-		otag = sg_virt(rctx->sg_dst) + len;
++		otag = rctx->sa_state->state_i_digest;
+ 		/* Convert the hardware's SHA digest words to tag bytes. */
+ 		if (!IS_HASH_MD5(flags)) {
+ 			for (i = 0; i < (authsize / 4); i++)
+@@ -772,6 +779,9 @@ process_tag:
+ 					 rctx->sg_src != reqsrc, rctx->sg_dst != reqdst);
+ 			}
+ 		}
++		if (IS_ENCRYPT(flags))
++			sg_pcopy_from_buffer(rctx->sg_dst, rctx->dst_nents,
++					     otag, authsize, len);
+ 	}
+ 
+ 	if (rctx->sg_src != rctx->sg_dst && rctx->sg_src != reqsrc)
+@@ -797,16 +807,6 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx
+ 			 sizeof(struct sa_record), DMA_TO_DEVICE);
+ 	kfree(rctx->sa_record);
+ 
+-	if (rctx->sa_state_ctr)
+-		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
+-				 sizeof(*rctx->sa_state_ctr),
+-				 DMA_BIDIRECTIONAL);
+-
+-	if (rctx->sa_state)
+-		dma_unmap_single(eip93->dev, rctx->sa_state_base,
+-				 sizeof(*rctx->sa_state),
+-				 DMA_BIDIRECTIONAL);
+-
+ 	if (!IS_ECB(rctx->flags))
+ 		memcpy(reqiv, rctx->sa_state->state_iv, rctx->ivsize);
+ 
+-- 
+2.52.0
+

@@ -1,0 +1,122 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Compare TLS 1.2 RX paths, with separate uninstrumented throughput controls.
+set -eu
+
+bench=${1:-./ktls-bench}
+out=${2:-./eip93-measure-$(date +%Y%m%d-%H%M%S)}
+params=/sys/module/${EIP93_MODULE:-crypto_hw_eip93}/parameters
+records=${RECORDS:-4096}
+runs=${RUNS:-5}
+threads=${THREADS:-2}
+
+if [ "$#" -gt 2 ] || ! command -v "$bench" >/dev/null 2>&1; then
+	echo "Usage: $0 [ktls-bench executable] [new output directory]" >&2
+	exit 1
+fi
+for number in "$records" "$runs" "$threads"; do
+	case "$number" in
+		''|*[!0-9]*) echo "RECORDS, RUNS and THREADS must be positive integers" >&2; exit 1 ;;
+	esac
+	if [ "$number" -le 0 ]; then
+		echo "RECORDS, RUNS and THREADS must be positive integers" >&2
+		exit 1
+	fi
+done
+if [ "$threads" -gt "$records" ]; then
+	echo "THREADS must not exceed RECORDS" >&2
+	exit 1
+fi
+
+# Read everything before changing a parameter. A missing profiler aborts here.
+old_profile=$(cat "$params/skcipher_profile")
+old_min=$(cat "$params/skcipher_profile_min_bytes")
+old_tail=$(cat "$params/skcipher_tail_align")
+old_debug=$(cat "$params/skcipher_dma_debug")
+test -r "$params/skcipher_profile_stats"
+umask 077
+mkdir "$out"
+
+restore()
+{
+	echo 0 > "$params/skcipher_profile" || :
+	echo "$old_tail" > "$params/skcipher_tail_align" || :
+	echo "$old_min" > "$params/skcipher_profile_min_bytes" || :
+	echo "$old_debug" > "$params/skcipher_dma_debug" || :
+	echo "$old_profile" > "$params/skcipher_profile" || :
+}
+trap restore 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+{
+	uname -a
+	printf 'records=%s runs=%s threads=%s\n' "$records" "$runs" "$threads"
+	for setting in dma_maxburst aes_sw_fallback skcipher_partial_src \
+		skcipher_tail_align skcipher_profile skcipher_profile_min_bytes; do
+		printf '%s=' "$setting"
+		cat "$params/$setting"
+	done
+	printf 'loopback_mtu='
+	cat /sys/class/net/lo/mtu
+	if [ -n "${EIP93_REG_BASE:-}" ]; then
+		printf 'dma_cfg='
+		devmem "$((EIP93_REG_BASE + 0x120))" 32
+		printf 'buffer_thresholds='
+		devmem "$((EIP93_REG_BASE + 0x10c))" 32
+	fi
+} > "$out/settings.txt"
+echo 0 > "$params/skcipher_profile"
+echo 0 > "$params/skcipher_dma_debug"
+echo 1024 > "$params/skcipher_profile_min_bytes"
+
+printf '%s\n' 'run,path,requests,descriptors_per_request,source_entries_per_request,software_bytes_per_request,source_copy_fraction,dest_copy_fraction,id_us,prepare_us,plan_us,map_us,submit_us,pending_us,complete_us,copy_us' > "$out/summary.csv"
+
+measure()
+{
+	profile=$1
+	tail=$2
+	name=profile${profile}-tail${tail}
+	echo "Running $name"
+	echo 0 > "$params/skcipher_profile"
+	echo "$tail" > "$params/skcipher_tail_align"
+	echo 0 > "$params/skcipher_profile_stats"
+	echo "$profile" > "$params/skcipher_profile"
+	if "$bench" -d rx -v 1.2 -j "$threads" -p 0 -w 0 -r "$runs" \
+		-n "$records" > "$out/$name.bench" 2>&1; then
+		echo 0 > "$params/skcipher_profile"
+	else
+		cat "$out/$name.bench" >&2
+		exit 1
+	fi
+	cat "$params/skcipher_profile_stats" > "$out/$name.stats"
+	awk '/^# gbps/ { print }' "$out/$name.bench"
+	[ "$profile" = 1 ] || return 0
+	# Encryption includes untimed ciphertext preparation; summarize RX only.
+	awk -F, -v name="$name" '
+		$1 == "path" { for (i = 1; i <= NF; i++) col[$i] = i; next }
+		$2 == "decrypt" && $(col["requests"]) > 0 {
+			n = $(col["requests"])
+			seen += n
+			bad += $(col["errors"])
+			printf "%s,%s,%.0f", name, $1, n
+			split("descriptors src_nents sw_bytes src_copies dst_copies", fields, " ")
+			for (i = 1; i <= 5; i++) printf ",%.6f", $(col[fields[i]]) / n
+			split("id_ns prepare_ns plan_ns map_ns submit_ns pending_ns complete_ns copy_ns", times, " ")
+			for (i = 1; i <= 8; i++) printf ",%.6f", $(col[times[i]]) / n / 1000
+			printf "\n"
+		}
+		END { if (!seen || bad) exit 1 }
+	' "$out/$name.stats" >> "$out/summary.csv" || {
+		echo "No successful EIP93 RX profile, or driver errors; see $out/$name.stats" >&2
+		exit 1
+	}
+}
+
+# Reverse the order in the instrumented pair to reduce fixed ordering bias.
+measure 0 0
+measure 0 1
+measure 1 1
+measure 1 0
+cat "$out/summary.csv"
+echo "Saved benchmark CSV, raw counters and settings in $out"

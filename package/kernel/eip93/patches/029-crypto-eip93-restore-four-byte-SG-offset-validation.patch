@@ -1,0 +1,46 @@
+From 431985ccfc8bd2de1c9cff4c0416213be288c3e0 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 01:46:27 +0800
+Subject: [PATCH] crypto: eip93 - restore four-byte SG offset validation
+
+Removing the SG offset check still causes intermittent device failures
+with the 64-byte input and output thresholds. The direct test reported
+an ECB-DES encryption mismatch in the final eight bytes of a 16368-byte
+request using the byte-offset layout (seed 1708171853, case 322).
+
+That layout uses a single source SG entry at allocation offset 129 and a
+separate destination at offset 131. The destination is already bounced
+for cache-line isolation, while the source is no longer bounced. ECB
+does not use an IV, counter or authentication tag.
+
+Revert patch 028 and restore the four-byte SG start-offset check. The
+lower DMA thresholds are insufficient to make unaligned sources safe
+on the tested device. Keep the 64-byte thresholds and native authenc
+packet-tag path; the prepared driver again matches release 20, which
+passed the full device test matrix with three repetitions.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-common.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index 8c42282..8850fc3 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -262,8 +262,12 @@ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+ 	int nents;
+ 
+ 	for (nents = 0; sg; sg = sg_next(sg), ++nents) {
++		if (!IS_ALIGNED(sg->offset, 4))
++			return false;
++
+ 		/*
+ 		 * DMA-written buffers must not share cache lines with CPU writes.
++		 * Read-only sources only need the hardware alignment checks.
+ 		 * dma_map_sg() maps the entire entry, including any bytes beyond
+ 		 * the requested crypt length in the last entry.
+ 		 */
+-- 
+2.52.0
+

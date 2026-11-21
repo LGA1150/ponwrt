@@ -1,0 +1,277 @@
+From fe75db300d8e6016892362cf4572fbbc1a9b9d57 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Mon, 16 Nov 2026 10:19:48 +0800
+Subject: [PATCH] tls: Preserve authenticated data before an async receive
+ failure
+
+A failed asynchronous TLS 1.2 decryption sets async_wait.err for the
+whole recvmsg call. The final wait then skips accounting for every
+submitted record, including records before the failure. With pcrypt,
+the existing bad_in_large_read selftest returns EBADMSG instead of the
+128 authenticated bytes preceding the corrupted record.
+
+Snapshot each request's position and buffered byte count before
+submission. Error callbacks retain the earliest failing position under
+a spinlock, independently of completion order. Drain all requests before
+using those counts to return the authenticated prefix and discard the
+buffered suffix. Keep the existing zero-copy path and persistent crypto
+error. The per-read error state remains live until all callbacks finish,
+including the backlog and input-retention failure paths.
+
+Allow receive, splice and read_sock to consume authenticated rx_list
+entries before reporting the persistent error. This preserves data
+retained by MSG_PEEK. Failed records and subsequent records are never
+retained on that list.
+
+Extend the existing tls_err fixture with failures in the middle of a
+read, a partially fitting bad record, and repeated peeks followed by
+receive and splice. Relay complete TLS records in the test helper.
+
+Original validation on QEMU TCG with pcrypt, KASAN and lockdep:
+- Reproduced bad_in_large_read before the change.
+- All 26 tls_err selftests passed with the fix applied independently,
+  before TLS 1.3 RX pipelining. No kernel diagnostics or test timeouts.
+- Kernel and selftests built; git diff --check and checkpatch.pl passed.
+
+OpenAI Codex assisted with diagnosis, implementation, regression tests
+and this changelog in response to a request to explain and fix the
+TLS 1.2 selftest failure.
+
+Fixes: 94524d8fc965 ("net/tls: Add support for async decryption of tls records")
+
+[6.18: Retain the psock argument and splice flags in receive waits.
+Introduce the shared record relay helper and its TLS header-length
+constant, and use the helper in bad_auth.]
+
+(cherry picked from commit 53aa3f3062f4322988a1e2492759e988fbf0a9cd
+ ("tls: Preserve authenticated data before an async receive failure"))
+---
+ net/tls/tls_sw.c | 102 +++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 82 insertions(+), 20 deletions(-)
+
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index 82f06c760e4a..86c813688809 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -48,12 +48,23 @@
+ 
+ #include "tls.h"
+ 
++struct tls_decrypt_async_error {
++	/* Protect the first failure and its byte counts across callbacks. */
++	spinlock_t lock;
++	size_t offset;
++	size_t copy_bytes;
++	int err;
++};
++
+ struct tls_decrypt_arg {
+ 	struct_group(inargs,
+ 	bool zc;
+ 	bool async;
+ 	bool async_done;
+ 	u8 tail;
++	struct tls_decrypt_async_error *async_error;
++	size_t offset;
++	size_t copy_bytes;
+ 	);
+ 
+ 	struct sk_buff *skb;
+@@ -61,6 +72,9 @@ struct tls_decrypt_arg {
+ 
+ struct tls_decrypt_ctx {
+ 	struct sock *sk;
++	struct tls_decrypt_async_error *async_error;
++	size_t offset;
++	size_t copy_bytes;
+ 	u8 iv[TLS_MAX_IV_SIZE];
+ 	u8 aad[TLS_MAX_AAD_SIZE];
+ 	u8 tail;
+@@ -218,6 +232,19 @@ static void tls_decrypt_done(void *data, int err)
+ 
+ 	/* Propagate if there was an err */
+ 	if (err) {
++		struct tls_decrypt_async_error *error = dctx->async_error;
++		unsigned long flags;
++
++		if (error) {
++			/* Completions need not follow record order. */
++			spin_lock_irqsave(&error->lock, flags);
++			if (!error->err || dctx->offset < error->offset) {
++				error->offset = dctx->offset;
++				error->copy_bytes = dctx->copy_bytes;
++				error->err = err;
++			}
++			spin_unlock_irqrestore(&error->lock, flags);
++		}
+ 		if (err == -EBADMSG)
+ 			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSDECRYPTERROR);
+ 		ctx->async_wait.err = err;
+@@ -1631,6 +1658,9 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
+ 	aead_req = (struct aead_request *)mem;
+ 	dctx = (struct tls_decrypt_ctx *)(mem + aead_size);
+ 	dctx->sk = sk;
++	dctx->async_error = darg->async_error;
++	dctx->offset = darg->offset;
++	dctx->copy_bytes = darg->copy_bytes;
+ 	sgin = &dctx->sg[0];
+ 	sgout = &dctx->sg[n_sgin];
+ 
+@@ -2118,6 +2148,24 @@ static void tls_rx_reader_unlock(struct sock *sk, struct tls_sw_context_rx *ctx)
+ 	release_sock(sk);
+ }
+ 
++/* Keep only the authenticated prefix, which ends at a record boundary. */
++static void tls_rx_list_trim(struct tls_sw_context_rx *ctx, size_t len)
++{
++	struct sk_buff *skb, *next;
++
++	skb_queue_walk_safe(&ctx->rx_list, skb, next) {
++		struct strp_msg *rxm = strp_msg(skb);
++
++		if (len && rxm->full_len <= len) {
++			len -= rxm->full_len;
++			continue;
++		}
++		len = 0;
++		__skb_unlink(skb, &ctx->rx_list);
++		consume_skb(skb);
++	}
++}
++
+ int tls_sw_recvmsg(struct sock *sk,
+ 		   struct msghdr *msg,
+ 		   size_t len,
+@@ -2126,6 +2174,7 @@ int tls_sw_recvmsg(struct sock *sk,
+ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
+ 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
++	struct tls_decrypt_async_error async_error = {};
+ 	ssize_t decrypted = 0, async_copy_bytes = 0;
+ 	struct sk_psock *psock;
+ 	unsigned char control = 0;
+@@ -2152,11 +2201,6 @@ int tls_sw_recvmsg(struct sock *sk,
+ 	psock = sk_psock_get(sk);
+ 	bpf_strp_enabled = sk_psock_strp_enabled(psock);
+ 
+-	/* If crypto failed the connection is broken */
+-	err = ctx->async_wait.err;
+-	if (err)
+-		goto end;
+-
+ 	/* Process pending decrypted records. It must be non-zero-copy */
+ 	err = process_rx_list(ctx, msg, &control, 0, len, is_peek, &rx_more);
+ 	if (err < 0)
+@@ -2168,6 +2212,12 @@ int tls_sw_recvmsg(struct sock *sk,
+ 	    (control && control != TLS_RECORD_TYPE_DATA))
+ 		goto end;
+ 
++	/* Deliver any authenticated prefix before reporting a crypto error. */
++	err = ctx->async_wait.err;
++	if (err)
++		goto end;
++
++	spin_lock_init(&async_error.lock);
+ 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+ 	len = len - copied;
+ 
+@@ -2212,6 +2262,13 @@ int tls_sw_recvmsg(struct sock *sk,
+ 		else
+ 			darg.async = false;
+ 
++		if (darg.async) {
++			/* Snapshot the prefix before submitting this record. */
++			darg.async_error = &async_error;
++			darg.offset = decrypted;
++			darg.copy_bytes = async_copy_bytes;
++		}
++
+ 		err = tls_rx_one_record(sk, msg, &darg);
+ 		if (err < 0) {
+ 			tls_err_abort(sk, -EBADMSG);
+@@ -2314,13 +2371,19 @@ int tls_sw_recvmsg(struct sock *sk,
+ 	}
+ 
+ recv_end:
+-	if (async) {
++	if (async || async_error.err) {
+ 		int ret;
+ 
+ 		/* Wait for all previously submitted records to be decrypted */
+ 		ret = tls_decrypt_async_wait(ctx);
+ 
+-		if (ret) {
++		if (async_error.err) {
++			decrypted = async_error.offset;
++			async_copy_bytes = async_error.copy_bytes;
++			tls_rx_list_trim(ctx, async_copy_bytes +
++					 (is_peek ? copied + peeked : 0));
++			ctx->async_wait.err = async_error.err;
++		} else if (ret) {
+ 			if (err >= 0 || err == -EINPROGRESS)
+ 				err = ret;
+ 			goto end;
+@@ -2328,14 +2391,15 @@ int tls_sw_recvmsg(struct sock *sk,
+ 
+ 		/* Drain records from the rx_list & copy if required */
+ 		if (is_peek)
+-			err = process_rx_list(ctx, msg, &control, copied + peeked,
++			ret = process_rx_list(ctx, msg, &control, copied + peeked,
+ 					      decrypted - peeked, is_peek, NULL);
+ 		else
+-			err = process_rx_list(ctx, msg, &control, 0,
++			ret = process_rx_list(ctx, msg, &control, 0,
+ 					      async_copy_bytes, is_peek, NULL);
+ 
+ 		/* we could have copied less than we wanted, and possibly nothing */
+-		decrypted += max(err, 0) - async_copy_bytes;
++		decrypted += max(ret, 0) - async_copy_bytes;
++		err = async_error.err ?: ret;
+ 	}
+ 
+ 	copied += decrypted;
+@@ -2365,17 +2429,16 @@ ssize_t tls_sw_splice_read(struct socket *sock,  loff_t *ppos,
+ 	if (err < 0)
+ 		return err;
+ 
+-	/* If crypto failed the connection is broken */
+-	err = ctx->async_wait.err;
+-	if (err)
+-		goto splice_read_end;
+-
+ 	for (;;) {
+ 		if (!skb_queue_empty(&ctx->rx_list)) {
+ 			skb = __skb_dequeue(&ctx->rx_list);
+ 		} else {
+ 			struct tls_decrypt_arg darg;
+ 
++			err = ctx->async_wait.err;
++			if (err)
++				goto splice_read_end;
++
+ 			err = tls_rx_rec_wait(sk, NULL, flags & SPLICE_F_NONBLOCK,
+ 					      true, false);
+ 			if (err <= 0)
+@@ -2456,11 +2519,6 @@ int tls_sw_read_sock(struct sock *sk, read_descriptor_t *desc,
+ 	if (err < 0)
+ 		return err;
+ 
+-	/* If crypto failed the connection is broken */
+-	err = ctx->async_wait.err;
+-	if (err)
+-		goto read_sock_end;
+-
+ 	decrypted = 0;
+ 	do {
+ 		if (!skb_queue_empty(&ctx->rx_list)) {
+@@ -2470,6 +2528,10 @@ int tls_sw_read_sock(struct sock *sk, read_descriptor_t *desc,
+ 		} else {
+ 			struct tls_decrypt_arg darg;
+ 
++			err = ctx->async_wait.err;
++			if (err)
++				goto read_sock_end;
++
+ 			err = tls_rx_rec_wait(sk, NULL, true, released, !!copied);
+ 			if (err <= 0)
+ 				goto read_sock_end;

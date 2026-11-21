@@ -1,0 +1,55 @@
+From afb59f5e8cb88f876e6286030a8c988fa986be7b Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 11:01:44 +0800
+Subject: [PATCH] crypto: eip93 - carry the final CTR counter wrap into the
+ returned IV
+
+The engine increments only the low 32 bits of its AES-CTR counter. The
+existing split handles wrapping inside a request, but not wrapping just
+after the final block: no split is needed to produce correct ciphertext,
+yet the saved state still lacks the carry into the high 96 bits.
+
+Propagate that carry when copying the completed ordinary CTR IV back to
+the caller. An all-ones IV with a one-block or shorter message must return
+zero, and a counter starting at fffffffe must carry after two blocks,
+including a partial last block. Keep the existing internal-wrap split and
+the RFC3686/authenc completion behavior.
+
+With size-based fallback disabled, the device matrix reported 198 such IV
+mismatches while ciphertext checks passed. A software driver model with a
+32-bit hardware counter reproduces the exact failing cases. The fix passes
+all 3564 CTR repetitions, 6336 skcipher cases and 12824 authenc cases in
+QEMU TCG, including both directions and partial blocks. Physical device
+validation remains required.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-common.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index b605c33..1a9eb92 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -908,8 +908,17 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx
+ 				 sizeof(*rctx->sa_state),
+ 				 DMA_BIDIRECTIONAL);
+ 
+-	if (!IS_ECB(rctx->flags))
++	if (!IS_ECB(rctx->flags)) {
+ 		memcpy(reqiv, rctx->sa_state->state_iv, rctx->ivsize);
++		/*
++		 * The engine increments only the low 32 counter bits. A wrap
++		 * on the last block needs no split, but still needs its carry
++		 * in the returned IV for the next ordinary CTR request.
++		 */
++		if (IS_CTR(rctx->flags) && !IS_RFC3686(rctx->flags) &&
++		    !rctx->authsize && !rctx->sa_state->state_iv[3])
++			crypto_inc(reqiv, AES_BLOCK_SIZE - sizeof(u32));
++	}
+ 
+ 	kfree(rctx->sa_state_ctr);
+ 	kfree(rctx->sa_state);
+-- 
+2.52.0
+

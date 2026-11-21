@@ -1,0 +1,410 @@
+From bc2e4473aa13c84ba4746b338207cdbb039bcc3f Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 17:18:06 +0800
+Subject: [PATCH] crypto: eip93 - align CTR reads across multiple source
+ entries
+
+Generic GCM and CCM prepend a tag block to the payload SG, so kTLS
+records never enter the single-entry CTR tail-alignment experiment.
+Direct unaligned payload descriptors retain an unaligned input tail.
+
+Extend the default-off skcipher_tail_align option to multi-entry AES
+CTR sources whose intermediate lengths are AES block multiples. Map the
+supplied source SG unchanged and plan each descriptor from its mapped
+address. Read up to three extra bytes to finish its last source word.
+
+Use independent, read-only IV states with SAVE_IV disabled. Derive each
+counter from the logical position rather than the padded predecessor,
+and split at logical counter wrap and the descriptor length limit.
+Place descriptor outputs in separate padded slots, then copy only their
+logical bytes back and return the IV advanced by the original length.
+
+Prepare all mappings before publishing descriptors, unwind failures,
+and avoid accessing the request after the final descriptor is queued.
+The existing single-entry path and ineligible layouts retain their
+previous handling. No source copy or private source SG is introduced.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-cipher.c |   8 +-
+ eip93-cipher.h |   7 ++
+ eip93-common.c | 275 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 286 insertions(+), 4 deletions(-)
+
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index 2fb2b8c..538b65f 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -30,8 +30,12 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
+ 	struct skcipher_request *req = skcipher_request_cast(async);
+ 	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
+ 
+-	err = eip93_unmap_dma(eip93, rctx, req->src, req->dst, err);
+-	eip93_handle_result(eip93, rctx, req->iv);
++	if (rctx->ctr_sg) {
++		err = eip93_complete_ctr_sg(eip93, req, err);
++	} else {
++		err = eip93_unmap_dma(eip93, rctx, req->src, req->dst, err);
++		eip93_handle_result(eip93, rctx, req->iv);
++	}
+ 
+ 	skcipher_request_complete(req, err);
+ }
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index 1ae48e5..0d042cf 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -12,6 +12,8 @@
+ 
+ #include "eip93-main.h"
+ 
++struct eip93_ctr_plan;
++
+ struct eip93_crypto_ctx {
+ 	struct eip93_device		*eip93;
+ 	u32				flags;
+@@ -37,6 +39,8 @@ struct eip93_cipher_reqctx {
+ 	unsigned int			authsize;
+ 	u8				tail_bytes;
+ 	u8				tail_iv[AES_BLOCK_SIZE];
++	bool				ctr_sg;
++	struct eip93_ctr_plan		*ctr_plan;
+ 	struct sa_record		*sa_record;
+ 	dma_addr_t			sa_record_base;
+ 	struct sa_state			*sa_state;
+@@ -61,6 +65,9 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err);
+ int eip93_send_req(struct crypto_async_request *async,
+ 		   const u8 *reqiv, struct eip93_cipher_reqctx *rctx);
+ 
++int eip93_complete_ctr_sg(struct eip93_device *eip93,
++			  struct skcipher_request *req, int err);
++
+ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 			 u8 *reqiv);
+ 
+diff --git a/eip93-common.c b/eip93-common.c
+index 9cd5a13..ef409b8 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -47,7 +47,7 @@ MODULE_PARM_DESC(skcipher_partial_src, "Diagnostic: allow single-entry partial-b
+ 
+ static bool skcipher_tail_align;
+ module_param(skcipher_tail_align, bool, 0600);
+-MODULE_PARM_DESC(skcipher_tail_align, "Diagnostic: word-align single-entry CTR reads by overreading up to three bytes");
++MODULE_PARM_DESC(skcipher_tail_align, "Diagnostic: word-align CTR source tails by overreading up to three bytes per descriptor");
+ 
+ static bool aead_unaligned_src;
+ module_param(aead_unaligned_src, bool, 0600);
+@@ -311,6 +311,21 @@ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+ 	return false;
+ }
+ 
++static bool eip93_ctr_sg_eligible(struct scatterlist *sg, u32 len)
++{
++	for (; sg; sg = sg_next(sg)) {
++		if (!sg->length)
++			return false;
++		if (len <= sg->length)
++			return true;
++		/* Each following descriptor must start at an AES block boundary. */
++		if (!IS_ALIGNED(sg->length, AES_BLOCK_SIZE))
++			return false;
++		len -= sg->length;
++	}
++	return false;
++}
++
+ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ {
+ 	struct scatterlist *src = rctx->sg_src;
+@@ -328,6 +343,8 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	int err = -EINVAL;
+ 
+ 	rctx->tail_bytes = 0;
++	rctx->ctr_sg = false;
++	rctx->ctr_plan = NULL;
+ 
+ 	/*
+ 	 * Allow byte-aligned AES skcipher reads. DES/3DES and authenc need
+@@ -373,9 +390,19 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 			return err;
+ 	}
+ 
+-	tail_align = !authsize && src != dst && src_nents == 1 &&
++	tail_align = !authsize && src != dst &&
+ 		     IS_AES(rctx->flags) && IS_CTR(rctx->flags) &&
+ 		     READ_ONCE(skcipher_tail_align);
++	if (tail_align && src_nents > 1) {
++		if (eip93_ctr_sg_eligible(src, textsize)) {
++			/* The CTR planner maps this SG unchanged and owns its output. */
++			rctx->ctr_sg = true;
++			rctx->src_nents = src_nents;
++			rctx->dst_nents = dst_nents;
++			return 0;
++		}
++		tail_align = false;
++	}
+ 	if (tail_align) {
+ 		u32 extra = -(src->offset + textsize) & 3;
+ 
+@@ -677,6 +704,248 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 	return -EINPROGRESS;
+ }
+ 
++struct eip93_ctr_chunk {
++	struct sa_state state;
++	dma_addr_t src;
++	u32 logical;
++	u32 output;
++	u32 len;
++	u32 tail;
++};
++
++struct eip93_ctr_plan {
++	struct eip93_ctr_chunk *chunks;
++	dma_addr_t dma;
++	u32 count;
++	u32 output_len;
++	u32 processed;
++};
++
++static void eip93_ctr_add(u8 *iv, u32 blocks)
++{
++	u64 counter = (u64)get_unaligned_be32(iv + 12) + blocks;
++
++	put_unaligned_be32(counter, iv + 12);
++	if (counter >> 32)
++		crypto_inc(iv, 12);
++}
++
++/* Count first, then fill the plan from the same mapped source segments. */
++static int eip93_plan_ctr_sg(struct eip93_cipher_reqctx *rctx, const u8 *iv,
++			     int mapped, struct eip93_ctr_plan *plan)
++{
++	const u32 max_len = round_down(FIELD_MAX(EIP93_PE_LENGTH_LENGTH),
++				       AES_BLOCK_SIZE);
++	u32 remaining = rctx->textsize, logical = 0, output = 0;
++	u32 count = 0, processed = 0;
++	struct scatterlist *sg;
++	int i;
++
++	for_each_sg(rctx->sg_src, sg, mapped, i) {
++		dma_addr_t addr = sg_dma_address(sg);
++		u32 available = min(remaining, sg_dma_len(sg));
++
++		while (available) {
++			u8 counter[AES_BLOCK_SIZE];
++			u32 len = min(available, max_len), tail, stride;
++			u64 until_wrap;
++
++			memcpy(counter, iv, sizeof(counter));
++			eip93_ctr_add(counter, logical / AES_BLOCK_SIZE);
++			until_wrap = ((u64)U32_MAX + 1 -
++				      get_unaligned_be32(counter + 12)) * AES_BLOCK_SIZE;
++			len = min_t(u64, len, until_wrap);
++			if (remaining > len && !IS_ALIGNED(len, AES_BLOCK_SIZE))
++				return -EINVAL;
++			tail = -(addr + len) & 3;
++			stride = ALIGN(len + tail, AES_BLOCK_SIZE);
++			if (plan->chunks) {
++				struct eip93_ctr_chunk *chunk;
++
++				if (count >= plan->count)
++					return -EINVAL;
++				chunk = &plan->chunks[count];
++				memcpy(chunk->state.state_iv, counter, sizeof(counter));
++				chunk->src = addr;
++				chunk->logical = logical;
++				chunk->output = output;
++				chunk->len = len;
++				chunk->tail = tail;
++			}
++			if (check_add_overflow(output, stride, &output) ||
++			    check_add_overflow(processed, len + tail, &processed))
++				return -EOVERFLOW;
++			count++;
++			logical += len;
++			remaining -= len;
++			available -= len;
++			addr += len;
++		}
++		if (!remaining)
++			break;
++	}
++	if (remaining || !count)
++		return -EINVAL;
++	plan->count = count;
++	plan->output_len = output;
++	plan->processed = processed;
++	return 0;
++}
++
++static int eip93_send_ctr_sg(struct crypto_async_request *async, const u8 *reqiv,
++			     struct eip93_cipher_reqctx *rctx)
++{
++	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
++	struct eip93_device *eip93 = ctx->eip93;
++	struct scatterlist *reqdst = rctx->sg_dst;
++	struct eip93_descriptor desc = {};
++	struct eip93_ctr_plan *plan;
++	u8 iv[AES_BLOCK_SIZE];
++	size_t state_bytes;
++	u32 count, i;
++	int mapped, err;
++	bool debug = READ_ONCE(eip93_skcipher_dma_debug);
++
++	mapped = dma_map_sg(eip93->dev, rctx->sg_src, rctx->src_nents, DMA_TO_DEVICE);
++	if (!mapped)
++		return -ENOMEM;
++	err = -ENOMEM;
++	plan = kzalloc(sizeof(*plan), GFP_KERNEL);
++	if (!plan)
++		goto unmap_src;
++	rctx->ctr_plan = plan;
++	if (IS_RFC3686(rctx->flags)) {
++		memcpy(iv, &ctx->sa_nonce, sizeof(ctx->sa_nonce));
++		memcpy(iv + 4, reqiv, CTR_RFC3686_IV_SIZE);
++		put_unaligned_be32(1, iv + 12);
++	} else {
++		memcpy(iv, reqiv, sizeof(iv));
++		memcpy(rctx->tail_iv, iv, sizeof(iv));
++		eip93_ctr_add(rctx->tail_iv, DIV_ROUND_UP_ULL(rctx->textsize, AES_BLOCK_SIZE));
++	}
++	err = eip93_plan_ctr_sg(rctx, iv, mapped, plan);
++	if (err)
++		goto free_plan;
++	err = -ENOMEM;
++	plan->chunks = kcalloc(plan->count, sizeof(*plan->chunks), GFP_KERNEL);
++	if (!plan->chunks)
++		goto free_plan;
++	err = eip93_plan_ctr_sg(rctx, iv, mapped, plan);
++	if (err)
++		goto free_chunks;
++	err = eip93_make_sg_copy(reqdst, &rctx->sg_dst, plan->output_len, false, 0);
++	if (err)
++		goto free_chunks;
++	rctx->dst_nents = 1;
++	err = -ENOMEM;
++	rctx->sa_record = kmemdup(ctx->sa_record, sizeof(*ctx->sa_record), GFP_KERNEL);
++	if (!rctx->sa_record)
++		goto free_output;
++	if (IS_DECRYPT(rctx->flags))
++		rctx->sa_record->sa_cmd0_word |= EIP93_SA_CMD_DIRECTION_IN;
++	/* Every descriptor has its own logical counter; hardware never updates it. */
++	rctx->sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_SAVE_IV;
++	state_bytes = (size_t)plan->count * sizeof(*plan->chunks);
++	plan->dma = dma_map_single(eip93->dev, plan->chunks, state_bytes, DMA_TO_DEVICE);
++	if (dma_mapping_error(eip93->dev, plan->dma))
++		goto free_sa;
++	rctx->sa_record_base = dma_map_single(eip93->dev, rctx->sa_record,
++					      sizeof(*rctx->sa_record), DMA_TO_DEVICE);
++	if (dma_mapping_error(eip93->dev, rctx->sa_record_base))
++		goto unmap_states;
++	if (!dma_map_sg(eip93->dev, rctx->sg_dst, 1, DMA_BIDIRECTIONAL))
++		goto unmap_sa;
++
++	desc.pe_ctrl_stat_word = FIELD_PREP(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN,
++					    EIP93_PE_CTRL_HOST_READY);
++	desc.sa_addr = rctx->sa_record_base;
++	count = plan->count;
++	if (debug)
++		dev_info(eip93->dev,
++			 "skcipher CTR SG: id=%d flags=%#x text=%u process=%u tail=%u src_copy=0 dst_copy=1 src_nents=%d mapped=%d descriptors=%u dma_cfg=%#x thresholds=%#x\n",
++			 rctx->request_id, rctx->flags, rctx->textsize, plan->processed,
++			 plan->processed - rctx->textsize, rctx->src_nents, mapped, count,
++			 readl(eip93->base + EIP93_REG_PE_DMA_CONFIG),
++			 readl(eip93->base + EIP93_REG_PE_BUF_THRESH));
++	for (i = 0; i < count; i++) {
++		const struct eip93_ctr_chunk *chunk = &plan->chunks[i];
++		bool last = i + 1 == count;
++
++		desc.src_addr = chunk->src;
++		desc.dst_addr = sg_dma_address(rctx->sg_dst) + chunk->output;
++		desc.state_addr = plan->dma + i * sizeof(*chunk);
++		desc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, rctx->request_id) |
++			FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS,
++				   rctx->desc_flags | (last ? EIP93_DESC_LAST : 0));
++		desc.pe_length_word = FIELD_PREP(EIP93_PE_LENGTH_HOST_PE_READY,
++						 EIP93_PE_LENGTH_HOST_READY) |
++			FIELD_PREP(EIP93_PE_LENGTH_LENGTH, chunk->len + chunk->tail);
++		if (debug)
++			dev_info(eip93->dev,
++				 "skcipher CTR desc: id=%d index=%u src=%#x dst=%#x logical=%u len=%u tail=%u offset=%u last=%d\n",
++				 rctx->request_id, i, desc.src_addr, desc.dst_addr,
++				 chunk->len, chunk->len + chunk->tail, chunk->tail,
++				 chunk->logical, last);
++		eip93_put_descriptor(eip93, &desc);
++		/* The final descriptor can complete and free the request immediately. */
++	}
++	return -EINPROGRESS;
++
++unmap_sa:
++	dma_unmap_single(eip93->dev, rctx->sa_record_base,
++			 sizeof(*rctx->sa_record), DMA_TO_DEVICE);
++unmap_states:
++	dma_unmap_single(eip93->dev, plan->dma, state_bytes, DMA_TO_DEVICE);
++free_sa:
++	kfree(rctx->sa_record);
++free_output:
++	eip93_free_sg_copy(plan->output_len, &rctx->sg_dst);
++free_chunks:
++	kfree(plan->chunks);
++free_plan:
++	kfree(plan);
++	rctx->ctr_plan = NULL;
++	rctx->sg_dst = reqdst;
++unmap_src:
++	dma_unmap_sg(eip93->dev, rctx->sg_src, rctx->src_nents, DMA_TO_DEVICE);
++	return err;
++}
++
++int eip93_complete_ctr_sg(struct eip93_device *eip93,
++			  struct skcipher_request *req, int err)
++{
++	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
++	struct eip93_ctr_plan *plan = rctx->ctr_plan;
++	u32 i;
++
++	dma_unmap_sg(eip93->dev, rctx->sg_src, rctx->src_nents, DMA_TO_DEVICE);
++	dma_unmap_sg(eip93->dev, rctx->sg_dst, 1, DMA_BIDIRECTIONAL);
++	dma_unmap_single(eip93->dev, plan->dma,
++			 (size_t)plan->count * sizeof(*plan->chunks), DMA_TO_DEVICE);
++	dma_unmap_single(eip93->dev, rctx->sa_record_base,
++			 sizeof(*rctx->sa_record), DMA_TO_DEVICE);
++	if (!err) {
++		for (i = 0; i < plan->count; i++) {
++			const struct eip93_ctr_chunk *chunk = &plan->chunks[i];
++
++			if (sg_pcopy_from_buffer(req->dst, sg_nents(req->dst),
++						 sg_virt(rctx->sg_dst) + chunk->output,
++						 chunk->len, chunk->logical) != chunk->len) {
++				err = -EINVAL;
++				break;
++			}
++		}
++		if (!err && !IS_RFC3686(rctx->flags))
++			memcpy(req->iv, rctx->tail_iv, AES_BLOCK_SIZE);
++	}
++	eip93_free_sg_copy(plan->output_len, &rctx->sg_dst);
++	kfree(rctx->sa_record);
++	kfree(plan->chunks);
++	kfree(plan);
++	rctx->ctr_plan = NULL;
++	return err;
++}
++
+ int eip93_send_req(struct crypto_async_request *async,
+ 		   const u8 *reqiv, struct eip93_cipher_reqctx *rctx)
+ {
+@@ -701,6 +970,8 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	err = check_valid_request(rctx);
+ 	if (err)
+ 		goto free_sg_copy;
++	if (rctx->ctr_sg)
++		return eip93_send_ctr_sg(async, reqiv, rctx);
+ 	datalen += rctx->tail_bytes;
+ 	split = datalen;
+ 	src = rctx->sg_src;
+-- 
+2.52.0
+

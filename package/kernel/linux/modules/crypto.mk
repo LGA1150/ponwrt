@@ -346,6 +346,22 @@ KernelPackage/crypto-ghash/mvebu/cortexa9=$(KernelPackage/crypto-ghash/arm-ce)
 $(eval $(call KernelPackage,crypto-ghash))
 
 
+define KernelPackage/crypto-ghash-arm64
+  TITLE:=ARM64 NEON GHASH and Crypto Extensions GCM
+  DEPENDS:=@aarch64 +kmod-crypto-ghash +kmod-crypto-aead
+  KCONFIG:=CONFIG_CRYPTO_GHASH_ARM64_CE CONFIG_CRYPTO_LIB_AES=y
+  FILES:=$(LINUX_DIR)/arch/arm64/crypto/ghash-ce.ko
+  $(call AddDepends/crypto)
+endef
+
+define KernelPackage/crypto-ghash-arm64/description
+  ARM64 GHASH using NEON on CPUs without PMULL, or fused AES-GCM on
+  CPUs with PMULL. Supplies ghash-ce.ko; load explicitly with modprobe.
+endef
+
+$(eval $(call KernelPackage,crypto-ghash-arm64))
+
+
 define KernelPackage/crypto-hash
   TITLE:=CryptoAPI hash support
   KCONFIG:=CONFIG_CRYPTO_HASH

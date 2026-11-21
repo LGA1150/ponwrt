@@ -1,0 +1,87 @@
+From 9221b8b138c6cdeaef984ca9eab0246753a60cdb Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 16:10:08 +0800
+Subject: [PATCH] crypto: eip93 - allow CTR tail reads beyond the supplied
+ source SG
+
+Let the opt-in skcipher_tail_align experiment consume the final partial
+word without requiring the caller to supply extra source SG capacity.
+Keep the original source SG, length and DMA mapping unchanged; do not
+allocate a replacement source entry or copy input data.
+
+Only the descriptor walk's local input budget includes the extra bytes.
+This prevents walking past the single source entry when the descriptor
+length exceeds its DMA length, including a split at CTR counter wrap.
+Keep private output and logical-length IV advancement from patch 039.
+
+Check that the mapped read ends on a word boundary before publishing any
+descriptor. If DMA changed the expected low address bits, unwind both SG
+mappings and the prepared SA/state without copying output back.
+
+This deliberately reads up to three bytes beyond the declared source DMA
+span when needed. The extension stays within its final aligned word and
+cannot newly cross a 1 KiB or page boundary. Keep the option disabled by
+default and retain its single-entry AES CTR scope.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-common.c | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index 69e5907..9cd5a13 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -47,7 +47,7 @@ MODULE_PARM_DESC(skcipher_partial_src, "Diagnostic: allow single-entry partial-b
+ 
+ static bool skcipher_tail_align;
+ module_param(skcipher_tail_align, bool, 0600);
+-MODULE_PARM_DESC(skcipher_tail_align, "Diagnostic: align the end of single-entry CTR input using mapped source padding");
++MODULE_PARM_DESC(skcipher_tail_align, "Diagnostic: word-align single-entry CTR reads by overreading up to three bytes");
+ 
+ static bool aead_unaligned_src;
+ module_param(aead_unaligned_src, bool, 0600);
+@@ -379,9 +379,8 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	if (tail_align) {
+ 		u32 extra = -(src->offset + textsize) & 3;
+ 
+-		/* Do not read beyond the source extent supplied by the caller. */
+-		if (extra > src->length - textsize ||
+-		    textsize > FIELD_MAX(EIP93_PE_LENGTH_LENGTH) - extra)
++		/* Only the descriptor length includes the extra input bytes. */
++		if (textsize > FIELD_MAX(EIP93_PE_LENGTH_LENGTH) - extra)
+ 			return -EMSGSIZE;
+ 		rctx->tail_bytes = extra;
+ 	}
+@@ -566,6 +565,14 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 	unsigned int descriptor = 0;
+ 	bool debug = !rctx->authsize && READ_ONCE(eip93_skcipher_dma_debug);
+ 
++	if (rctx->tail_bytes) {
++		/* DMA must preserve the word offset used to size the extension. */
++		if (!IS_ALIGNED(saddr + datalen, 4))
++			return -EINVAL;
++		/* Overread this single source entry without changing its SG. */
++		remainin = datalen;
++	}
++
+ 	if (IS_ECB(rctx->flags))
+ 		rctx->sa_state_base = 0;
+ 
+@@ -847,8 +854,12 @@ skip_iv:
+ 			 readl(eip93->base + EIP93_REG_PE_DMA_CONFIG),
+ 			 readl(eip93->base + EIP93_REG_PE_BUF_THRESH));
+ 
+-	return eip93_scatter_combine(eip93, rctx, datalen, split, offsetin);
++	err = eip93_scatter_combine(eip93, rctx, datalen, split, offsetin);
++	if (err == -EINPROGRESS)
++		return err;
+ 
++	if (src != dst)
++		dma_unmap_sg(eip93->dev, src, rctx->src_nents, DMA_TO_DEVICE);
+ unmap_sg_dst:
+ 	dma_unmap_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL);
+ unmap_sa_state:
+-- 
+2.52.0
+

@@ -1,0 +1,53 @@
+From d68962e0e1352978412fc416cc650906c5ecef6a Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Tue, 17 Nov 2026 15:12:55 +0800
+Subject: [PATCH] crypto: eip93 - select the AES fallback limit by key size
+
+PonWrt's small-request fallback uses AES_KEYSIZE_128 as a condition. That
+constant is always nonzero, so AES-192 and AES-256 also use the AES-128
+threshold, ignoring CRYPTO_DEV_EIP93_GENERIC_SW_MAX_LEN.
+
+Remember the successfully configured encryption key length and compare
+it with AES_KEYSIZE_128 when choosing the fallback threshold. With the
+package defaults, AES-192/256 requests above 256 bytes use hardware while
+AES-128 retains its 512-byte software threshold.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-cipher.c | 3 ++-
+ eip93-cipher.h | 1 +
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index c6a4f52..82d1a1d 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -137,6 +137,7 @@ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
+ 	memcpy(sa_record->sa_key, key, keylen);
+ 	ctx->sa_nonce = nonce;
+ 	sa_record->sa_nonce = nonce;
++	ctx->keylen = keylen;
+ 
+ 	return 0;
+ }
+@@ -163,7 +164,7 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 			return -EINVAL;
+ 
+ 	if (fallback &&
+-	    req->cryptlen <= (AES_KEYSIZE_128 ?
++	    req->cryptlen <= (ctx->keylen == AES_KEYSIZE_128 ?
+ 			      CONFIG_CRYPTO_DEV_EIP93_AES_128_SW_MAX_LEN :
+ 			      CONFIG_CRYPTO_DEV_EIP93_GENERIC_SW_MAX_LEN)) {
+ 		skcipher_request_set_tfm(&rctx->fallback_req, ctx->fallback);
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index 7726a83..36e3fc0 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -16,6 +16,7 @@ struct eip93_crypto_ctx {
+ 	struct sa_record		*sa_record;
+ 	u32				sa_nonce;
+ 	int				blksize;
++	unsigned int			keylen;
+ 	/* AEAD specific */
+ 	unsigned int			authsize;
+ 	enum eip93_alg_type		type;

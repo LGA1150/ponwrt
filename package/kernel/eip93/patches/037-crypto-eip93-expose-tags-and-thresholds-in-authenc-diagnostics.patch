@@ -1,0 +1,65 @@
+From 9a783ee2ced0b462a3db96fc8b95f8d679b4ace5 Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Wed, 18 Nov 2026 11:42:36 +0800
+Subject: [PATCH] crypto: eip93 - expose tag bytes and thresholds in authenc
+ diagnostics
+
+The source-offset comparison for SHA1/CBC case 267 fails valid decryption
+at offset one and passes at offset four. The engine reports success but
+all twelve returned tag bytes differ. This persists at raw MXBRSTSZ six;
+the byte mask alone cannot distinguish a corrupted digest write from a
+wrong digest computed over corrupted input.
+
+Extend the existing opt-in mismatch log with the input and output tags in
+comparison byte order. Include PE_BUF_THRESH beside the DMA configuration
+in the opt-in mapping log so threshold and burst experiments record both
+registers. Only the configured tag length is printed, after DMA unmapping
+and before the buffers are freed.
+
+Keep the diagnostics disabled by default and retain authentication checks,
+private decryption output, alignment policy and DMA defaults. No source
+bounce or software fallback is added.
+
+Signed-off-by: Qingfang Deng <dqfext@gmail.com>
+---
+ eip93-common.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index 1a9eb92..dd081f6 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -777,13 +777,14 @@ skip_iv:
+ 
+ 	if (rctx->authsize && READ_ONCE(eip93_aead_dma_debug))
+ 		dev_info(eip93->dev,
+-			 "authenc DMA: id=%d flags=%#x text=%u aad=%u tag=%u process=%u src=%pad dst=%pad src_map=%u dst_map=%u src_copy=%d dst_copy=%d src_off=%u dst_off=%u sa=%pad state=%pad dma_cfg=%#x\n",
++			 "authenc DMA: id=%d flags=%#x text=%u aad=%u tag=%u process=%u src=%pad dst=%pad src_map=%u dst_map=%u src_copy=%d dst_copy=%d src_off=%u dst_off=%u sa=%pad state=%pad dma_cfg=%#x thresholds=%#x\n",
+ 			 rctx->request_id, flags, rctx->textsize, rctx->assoclen,
+ 			 rctx->authsize, datalen, &sg_dma_address(src),
+ 			 &sg_dma_address(dst), sg_dma_len(src), sg_dma_len(dst),
+ 			 src != reqsrc, dst != reqdst, src->offset, dst->offset,
+ 			 &rctx->sa_record_base, &rctx->sa_state_base,
+-			 readl(eip93->base + EIP93_REG_PE_DMA_CONFIG));
++			 readl(eip93->base + EIP93_REG_PE_DMA_CONFIG),
++			 readl(eip93->base + EIP93_REG_PE_BUF_THRESH));
+ 	if (!rctx->authsize && READ_ONCE(eip93_skcipher_dma_debug))
+ 		dev_info(eip93->dev,
+ 			 "skcipher DMA: id=%d flags=%#x text=%u src=%pad dst=%pad src_map=%u dst_map=%u src_copy=%d dst_copy=%d src_off=%u dst_off=%u src_nents=%d dst_nents=%d dma_cfg=%#x thresholds=%#x\n",
+@@ -867,10 +868,11 @@ process_tag:
+ 					if (itag[i] != otag[i])
+ 						different |= BIT(i);
+ 				dev_info(eip93->dev,
+-					 "authenc tag mismatch: id=%d flags=%#x text=%u aad=%u tag=%u different=%08x src_copy=%d dst_copy=%d\n",
++					 "authenc tag mismatch: id=%d flags=%#x text=%u aad=%u tag=%u different=%08x src_copy=%d dst_copy=%d input_tag=%*phN output_tag=%*phN\n",
+ 					 rctx->request_id, flags, rctx->textsize,
+ 					 rctx->assoclen, authsize, different,
+-					 rctx->sg_src != reqsrc, rctx->sg_dst != reqdst);
++					 rctx->sg_src != reqsrc, rctx->sg_dst != reqdst,
++					 authsize, itag, authsize, otag);
+ 			}
+ 		}
+ 	}
+-- 
+2.52.0
+

@@ -1,0 +1,98 @@
+From 2a1919c089b0bb1c7da2c652b91256fe4c1fba9f Mon Sep 17 00:00:00 2001
+From: Qingfang Deng <dqfext@gmail.com>
+Date: Mon, 16 Nov 2026 12:24:35 +0800
+Subject: [PATCH] tls: Drain pending transmit records before rekeying
+
+MSG_MORE can leave full records being encrypted asynchronously and a
+partial record open. TLS_TX currently replaces the shared AEAD key
+without draining these requests or closing the old-key record. A
+65549-byte MSG_MORE send followed by rekey reproduces an authentication
+failure after the first 65536 bytes.
+
+Serialize TLS_TX configuration against senders with tx_lock, including
+when a sender temporarily drops the socket lock for memory pressure.
+Flush the open record and wait for pending encryptions before changing
+the transform. Already encrypted records retain their order in tx_list
+and need not wait for TCP transmission before the key changes.
+
+Add rekey_send_pending to the existing TLS fixture, testing full records
+and a partial record across the key boundary. Document the TX barrier.
+
+Validation: reproduced the short receive on the preceding kernel with
+pcrypt; all 117 focused tests passed after the change, including the
+new rekey test across TLS 1.3 cipher variants. QEMU TCG used KASAN and
+lockdep. Kernel/selftest builds, diff checks and checkpatch passed.
+
+OpenAI Codex assisted with diagnosis, implementation, regression tests
+and this changelog while extending asynchronous kTLS I/O coverage.
+
+Fixes: 47069594e67e ("tls: implement rekey for TLS1.3")
+(cherry picked from commit 491f71992c4e43a80d84d1439b5d95c4ea603f69)
+
+Backport: keep the key unchanged and return EAGAIN if the older BPF TX
+verdict path leaves plaintext open after splitting a record. The caller
+can retry after that record is flushed.
+---
+ net/tls/tls_main.c |  9 +++++++++
+ net/tls/tls_sw.c   | 19 +++++++++++++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index bd8314da214f..dbbde17b8483 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -823,15 +823,24 @@ static int do_tls_setsockopt_no_pad(struct sock *sk, sockptr_t optval,
+ static int do_tls_setsockopt(struct sock *sk, int optname, sockptr_t optval,
+ 			     unsigned int optlen)
+ {
++	struct tls_context *ctx;
+ 	int rc = 0;
+ 
+ 	switch (optname) {
+ 	case TLS_TX:
+ 	case TLS_RX:
++		ctx = tls_get_ctx(sk);
++		if (optname == TLS_TX) {
++			rc = mutex_lock_interruptible(&ctx->tx_lock);
++			if (rc)
++				break;
++		}
+ 		lock_sock(sk);
+ 		rc = do_tls_setsockopt_conf(sk, optval, optlen,
+ 					    optname == TLS_TX);
+ 		release_sock(sk);
++		if (optname == TLS_TX)
++			mutex_unlock(&ctx->tx_lock);
+ 		break;
+ 	case TLS_TX_ZEROCOPY_RO:
+ 		lock_sock(sk);
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index c1b7ebe454b6..ffdc6486837a 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -3226,6 +3226,25 @@ int tls_set_sw_offload(struct sock *sk, int tx,
+ 		crypto_info = &ctx->crypto_send.info;
+ 		cctx = &ctx->tx;
+ 		aead = &sw_ctx_tx->aead_send;
++		if (new_crypto_info) {
++			/* Finish using the old key before changing the shared
++			 * transform. Ciphertext can remain queued for TCP.
++			 */
++			rc = tls_sw_push_pending_record(sk, 0);
++			if (rc && rc != -EINPROGRESS && rc != -EAGAIN)
++				goto out;
++			/* A BPF verdict can split the record and leave plaintext
++			 * pending after the first part was queued for TCP.
++			 */
++			if (sw_ctx_tx->open_rec &&
++			    sw_ctx_tx->open_rec->msg_plaintext.sg.size) {
++				rc = -EAGAIN;
++				goto out;
++			}
++			rc = tls_encrypt_async_wait(sw_ctx_tx);
++			if (rc)
++				goto out;
++		}
+ 	} else {
+ 		sw_ctx_rx = ctx->priv_ctx_rx;
+ 		crypto_info = &ctx->crypto_recv.info;
