@@ -1,0 +1,84 @@
+From 9085a997f0fb94fa99647179e2e5aa7ec13d4c01 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:13:10 +0800
+Subject: [PATCH] crypto: eip93 - limit source alignment to DES and short
+ authenc
+
+Keep word-aligned sources for DES and 3DES, which showed input-tail
+corruption on larger unaligned requests. Allow byte-aligned read-only
+AES sources while retaining the existing SG and block-length checks.
+
+Short authenc requests need an exception: the six-byte case-14 input
+fails at raw MXBRSTSZ 5 and 6 when it spans two partial words, and padding
+the source mapping does not help. Bounce unaligned authenc sources when
+AAD plus payload is smaller than two 32-bit words. Use the processed
+length before adding the received tag, so decryption gets the same guard
+even if its input mapping includes a tag or extra padding. Aligned short
+requests still use hardware directly.
+
+Keep destination cache-line isolation, private decryption output and
+the existing empty/AAD-range and small-skcipher software fallbacks. The
+root-only diagnostic switches can still bypass the source guards for
+experiments; both remain off by default.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-common.c | 22 +++++++++++++++-------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index f257fe5..c34d9cc 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -39,11 +39,11 @@ MODULE_PARM_DESC(skcipher_dma_debug, "Log skcipher DMA mappings, descriptors and
+ 
+ static bool skcipher_unaligned_src;
+ module_param(skcipher_unaligned_src, bool, 0600);
+-MODULE_PARM_DESC(skcipher_unaligned_src, "Diagnostic: allow unaligned read-only skcipher sources (known to corrupt data)");
++MODULE_PARM_DESC(skcipher_unaligned_src, "Diagnostic: bypass DES/3DES source alignment checks (known to corrupt data)");
+ 
+ static bool aead_unaligned_src;
+ module_param(aead_unaligned_src, bool, 0600);
+-MODULE_PARM_DESC(aead_unaligned_src, "Diagnostic: allow unaligned read-only authenc sources (known to corrupt data)");
++MODULE_PARM_DESC(aead_unaligned_src, "Diagnostic: bypass authenc source alignment safeguards (known to corrupt data)");
+ 
+ static unsigned int aead_src_offset;
+ static unsigned int aead_dst_offset;
+@@ -280,7 +280,7 @@ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+ 
+ 		/*
+ 		 * DMA-written buffers must not share cache lines with CPU writes.
+-		 * The diagnostic bypass applies only to read-only source offsets.
++		 * Read-only sources follow the cipher and short-message policy.
+ 		 * dma_map_sg() maps the entire entry, including any bytes beyond
+ 		 * the requested crypt length in the last entry.
+ 		 */
+@@ -314,13 +314,21 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	u32 totlen_dst = rctx->assoclen + rctx->textsize;
+ 	u32 copy_len;
+ 	unsigned int src_offset = 0, dst_offset = 0;
+-	bool src_align, dst_align;
+-	bool allow_unaligned = src != dst &&
+-		(authsize ? READ_ONCE(aead_unaligned_src) :
+-			    READ_ONCE(skcipher_unaligned_src));
++	bool src_align, dst_align, allow_unaligned;
+ 	int src_nents, dst_nents;
+ 	int err = -EINVAL;
+ 
++	/*
++	 * Allow byte-aligned AES reads, but keep DES/3DES sources aligned.
++	 * Short authenc inputs can span only partial words: require aligned
++	 * sources below two words, using AAD plus payload before adding the tag.
++	 */
++	allow_unaligned = IS_AES(rctx->flags) &&
++			  (!authsize || totlen_src >= 2 * sizeof(u32));
++	if (src != dst)
++		allow_unaligned |= authsize ? READ_ONCE(aead_unaligned_src) :
++					     READ_ONCE(skcipher_unaligned_src);
++
+ 	if (!IS_CTR(rctx->flags)) {
+ 		if (!IS_ALIGNED(textsize, blksize))
+ 			return err;
+-- 
+2.52.0
+

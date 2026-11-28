@@ -1,0 +1,66 @@
+From 9a7acaec6bb47d88ec48d0550395375324f8f55d Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:10:32 +0800
+Subject: [PATCH] crypto: eip93 - restore hardware authenc for partial output
+ words
+
+The DMA buffer thresholds are now below the output threshold associated
+with intermittent authenc tail corruption. Remove patch 022's fallback
+for AAD-plus-payload lengths that are not multiples of four, allowing
+those requests to use hardware again.
+
+Also remove the aead_allow_partial diagnostic parameter from patch 023:
+there is no longer a partial-word fallback for it to bypass. Keep the
+empty-payload and unrepresentable-AAD fallbacks and all SG alignment
+checks.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-aead.c   | 5 -----
+ eip93-common.c | 4 ----
+ eip93-common.h | 1 -
+ 3 files changed, 10 deletions(-)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 20c4541..8f4c1aa 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -248,11 +248,6 @@ static bool eip93_aead_needs_fallback(struct aead_request *req,
+ 	if (!textsize)
+ 		return true;
+ 
+-	/* A partial output word can repeat its last byte on Airoha. */
+-	if (!IS_ALIGNED(req->assoclen + textsize, sizeof(u32)) &&
+-	    !READ_ONCE(eip93_aead_allow_partial))
+-		return true;
+-
+ 	if (IS_ALIGNED(req->assoclen, sizeof(u32)))
+ 		return req->assoclen / sizeof(u32) > max_offset;
+ 
+diff --git a/eip93-common.c b/eip93-common.c
+index 518c4ea..4f35b46 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -33,10 +33,6 @@ bool eip93_aead_dma_debug;
+ module_param_named(aead_dma_debug, eip93_aead_dma_debug, bool, 0600);
+ MODULE_PARM_DESC(aead_dma_debug, "Log authenc DMA addresses, lengths and all completions");
+ 
+-bool eip93_aead_allow_partial;
+-module_param_named(aead_allow_partial, eip93_aead_allow_partial, bool, 0600);
+-MODULE_PARM_DESC(aead_allow_partial, "Diagnostic only: allow unreliable partial-word authenc DMA output");
+-
+ static unsigned int aead_src_offset;
+ static unsigned int aead_dst_offset;
+ 
+diff --git a/eip93-common.h b/eip93-common.h
+index 0216cc4..47fde69 100644
+--- a/eip93-common.h
++++ b/eip93-common.h
+@@ -11,7 +11,6 @@
+ 
+ extern bool eip93_aead_debug;
+ extern bool eip93_aead_dma_debug;
+-extern bool eip93_aead_allow_partial;
+ 
+ int eip93_alloc_req_id(struct eip93_device *eip93,
+ 		       struct crypto_async_request *async);

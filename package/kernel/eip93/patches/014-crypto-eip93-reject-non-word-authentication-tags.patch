@@ -1,0 +1,32 @@
+From 4216766763680c90841804813aaf812740397bd1 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 15:12:10 +0800
+Subject: [PATCH] crypto: eip93 - reject non-word authentication tag sizes
+
+The SA digest-length field counts 32-bit words. Accepting an arbitrary
+byte length silently rounds it down, so a requested 13-byte tag programs
+only 12 bytes while request accounting still uses 13.
+
+Reject lengths the hardware field cannot represent before changing the
+transform or SA record. The AEAD core already checks zero and lengths
+above the algorithm's maximum.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-aead.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 9704f77..4a59eac 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -144,6 +144,9 @@ static int eip93_aead_setauthsize(struct crypto_aead *ctfm,
+ 	struct crypto_tfm *tfm = crypto_aead_tfm(ctfm);
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
++	if (!IS_ALIGNED(authsize, sizeof(u32)))
++		return -EINVAL;
++
+ 	ctx->authsize = authsize;
+ 	ctx->sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_DIGEST_LENGTH;
+ 	ctx->sa_record->sa_cmd0_word |= FIELD_PREP(EIP93_SA_CMD_DIGEST_LENGTH,

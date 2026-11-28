@@ -1,0 +1,54 @@
+From 75061a913c0c27d5dc40fd62f37a6b8853847756 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 19:48:02 +0800
+Subject: [PATCH] crypto: eip93 - avoid partial DMA output words in authenc
+
+Reading authenc tags from saved hash state avoids packet-tag corruption,
+but Airoha also corrupts partial final words of the cipher payload. The
+direct test reports two incorrect plaintext bytes in SHA224/RFC3686 case
+323 despite successful tag verification. Its 16368-byte payload and
+63-byte AAD produce 16431 output bytes. The first of the final three bytes
+changes from 0x48 to 0xb4, matching the last output byte, while both DMA
+buffers already use aligned bounce allocations.
+
+Use the existing synchronous authenc fallback when AAD plus cipher
+payload is not a multiple of four. Check the actual output length in both
+directions, excluding the received tag on decryption. Passing the exact
+original request to the fallback preserves its HMAC and ciphertext;
+padding the authenticated input to round the DMA length would not.
+Word-multiple requests continue through the hardware path subject to the
+existing empty-payload and AAD-offset restrictions.
+
+This conservatively avoids partial packet-output words for authenc and
+costs hardware acceleration for those lengths. It does not change DMA
+burst settings or establish the underlying hardware/interconnect fault.
+
+Host GCC 14.2 W=1 builds the full module. A QEMU software model with
+partial-word byte replication reproduces the reported decrypt mismatch
+before the guard. Afterward, the existing test module passes all 12824
+authenc cases, with 14436 modeled async operations and no partial output
+word reaching the model. Physical EIP93 confirmation is still needed.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-aead.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index fdc9ace..b1978c6 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -244,6 +244,10 @@ static bool eip93_aead_needs_fallback(struct aead_request *req,
+ 	if (!textsize)
+ 		return true;
+ 
++	/* A partial output word can repeat its last byte on Airoha. */
++	if (!IS_ALIGNED(req->assoclen + textsize, sizeof(u32)))
++		return true;
++
+ 	if (IS_ALIGNED(req->assoclen, sizeof(u32)))
+ 		return req->assoclen / sizeof(u32) > max_offset;
+ 
+-- 
+2.52.0
+

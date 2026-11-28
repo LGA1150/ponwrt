@@ -1,0 +1,286 @@
+From 9860d349eb0714c3d139ad28340302cfb2ab09c4 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 11:24:50 +0800
+Subject: [PATCH 5/6] crypto: eip93 - consume results before recycling ring
+ slots
+
+Protect command and result pointers with one lock. Copy a completed
+result and acknowledge it before advancing the read pointers, so a
+concurrent producer cannot overwrite its completion ID. Order descriptor
+publication before its doorbell under the same lock.
+
+Check descriptor ownership once and return to the interrupt path if DMA
+has not completed, instead of spinning indefinitely in the tasklet.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-common.c | 99 +++++++++++++++++++++++---------------------------
+ eip93-common.h |  3 +-
+ eip93-hash.c   |  5 +--
+ eip93-main.c   | 38 ++++++++-----------
+ eip93-main.h   |  4 +-
+ 5 files changed, 65 insertions(+), 84 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index a02da48..fdcebdf 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -87,76 +87,70 @@ int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err)
+ 	}
+ }
+ 
+-static void *eip93_ring_next_wptr(struct eip93_device *eip93,
+-				  struct eip93_desc_ring *ring)
++static void eip93_ring_advance(struct eip93_desc_ring *ring, void **ptr)
+ {
+-	void *ptr = ring->write;
+-
+-	if ((ring->write == ring->read - ring->offset) ||
+-	    (ring->read == ring->base && ring->write == ring->base_end))
+-		return ERR_PTR(-ENOMEM);
+-
+-	if (ring->write == ring->base_end)
+-		ring->write = ring->base;
+-	else
+-		ring->write += ring->offset;
+-
+-	return ptr;
+-}
+-
+-static void *eip93_ring_next_rptr(struct eip93_device *eip93,
+-				  struct eip93_desc_ring *ring)
+-{
+-	void *ptr = ring->read;
+-
+-	if (ring->write == ring->read)
+-		return ERR_PTR(-ENOENT);
+-
+-	if (ring->read == ring->base_end)
+-		ring->read = ring->base;
++	if (*ptr == ring->base_end)
++		*ptr = ring->base;
+ 	else
+-		ring->read += ring->offset;
+-
+-	return ptr;
++		*ptr += ring->offset;
+ }
+ 
+ int eip93_put_descriptor(struct eip93_device *eip93,
+ 			 struct eip93_descriptor *desc)
+ {
+-	struct eip93_descriptor *cdesc;
+-	struct eip93_descriptor *rdesc;
++	struct eip93_desc_ring *cdr = &eip93->ring->cdr;
++	struct eip93_desc_ring *rdr = &eip93->ring->rdr;
+ 
+-	rdesc = eip93_ring_next_wptr(eip93, &eip93->ring->rdr);
+-	if (IS_ERR(rdesc))
+-		return -ENOENT;
++	guard(spinlock_irqsave)(&eip93->ring->lock);
+ 
+-	cdesc = eip93_ring_next_wptr(eip93, &eip93->ring->cdr);
+-	if (IS_ERR(cdesc))
+-		return -ENOENT;
++	if ((cdr->write == cdr->read - cdr->offset) ||
++	    (cdr->read == cdr->base && cdr->write == cdr->base_end))
++		return -ENOSPC;
+ 
+-	memset(rdesc, 0, sizeof(struct eip93_descriptor));
++	memset(rdr->write, 0, sizeof(struct eip93_descriptor));
++	memcpy(cdr->write, desc, sizeof(struct eip93_descriptor));
++	eip93_ring_advance(cdr, &cdr->write);
++	eip93_ring_advance(rdr, &rdr->write);
+ 
+-	memcpy(cdesc, desc, sizeof(struct eip93_descriptor));
++	/* Publish the descriptor before ringing the doorbell. */
++	dma_wmb();
++	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
+ 
+ 	return 0;
+ }
+ 
+-void *eip93_get_descriptor(struct eip93_device *eip93)
++int eip93_get_descriptor(struct eip93_device *eip93,
++			 struct eip93_descriptor *desc)
+ {
+-	struct eip93_descriptor *cdesc;
+-	void *ptr;
++	struct eip93_desc_ring *cdr = &eip93->ring->cdr;
++	struct eip93_desc_ring *rdr = &eip93->ring->rdr;
++	struct eip93_descriptor *rdesc;
++	u32 ctrl, len;
+ 
+-	cdesc = eip93_ring_next_rptr(eip93, &eip93->ring->cdr);
+-	if (IS_ERR(cdesc))
+-		return ERR_PTR(-ENOENT);
++	guard(spinlock_irqsave)(&eip93->ring->lock);
+ 
+-	memset(cdesc, 0, sizeof(struct eip93_descriptor));
++	if (cdr->read == cdr->write)
++		return -ENOENT;
++
++	rdesc = rdr->read;
++	ctrl = READ_ONCE(rdesc->pe_ctrl_stat_word);
++	len = READ_ONCE(rdesc->pe_length_word);
++	if (FIELD_GET(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN, ctrl) !=
++	    EIP93_PE_CTRL_PE_READY ||
++	    FIELD_GET(EIP93_PE_LENGTH_HOST_PE_READY, len) !=
++	    EIP93_PE_LENGTH_PE_READY)
++		return -EAGAIN;
+ 
+-	ptr = eip93_ring_next_rptr(eip93, &eip93->ring->rdr);
+-	if (IS_ERR(ptr))
+-		return ERR_PTR(-ENOENT);
++	dma_rmb();
++	*desc = *rdesc;
++	memset(cdr->read, 0, sizeof(struct eip93_descriptor));
+ 
+-	return ptr;
++	/* Copy and acknowledge the result before allowing slot reuse. */
++	writel(1, eip93->base + EIP93_REG_PE_RD_COUNT);
++	eip93_ring_advance(cdr, &cdr->read);
++	eip93_ring_advance(rdr, &rdr->read);
++
++	return 0;
+ }
+ 
+ static void eip93_free_sg_copy(const int len, struct scatterlist **sg)
+@@ -516,15 +510,12 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 		 * Maybe refine by slowing down at EIP93_RING_BUSY
+ 		 */
+ again:
+-		scoped_guard(spinlock_irqsave, &eip93->ring->write_lock)
+-			err = eip93_put_descriptor(eip93, cdesc);
++		err = eip93_put_descriptor(eip93, cdesc);
+ 		if (err) {
+ 			usleep_range(EIP93_RING_BUSY_DELAY,
+ 				     EIP93_RING_BUSY_DELAY * 2);
+ 			goto again;
+ 		}
+-		/* Writing new descriptor count starts DMA action */
+-		writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
+ 	} while (n);
+ 
+ 	return -EINPROGRESS;
+diff --git a/eip93-common.h b/eip93-common.h
+index 3ec63b7..3f69990 100644
+--- a/eip93-common.h
++++ b/eip93-common.h
+@@ -13,7 +13,8 @@ int eip93_alloc_req_id(struct eip93_device *eip93,
+ 		       struct crypto_async_request *async);
+ void eip93_free_req_id(struct eip93_device *eip93, int id);
+ 
+-void *eip93_get_descriptor(struct eip93_device *eip93);
++int eip93_get_descriptor(struct eip93_device *eip93,
++			 struct eip93_descriptor *desc);
+ int eip93_put_descriptor(struct eip93_device *eip93, struct eip93_descriptor *desc);
+ 
+ void eip93_set_sa_record(struct sa_record *sa_record, const unsigned int keylen,
+diff --git a/eip93-hash.c b/eip93-hash.c
+index b618c1d..ea03c46 100644
+--- a/eip93-hash.c
++++ b/eip93-hash.c
+@@ -278,16 +278,13 @@ static void eip93_send_hash_req(struct eip93_device *eip93,
+ 	int ret;
+ 
+ again:
+-	scoped_guard(spinlock_irqsave, &eip93->ring->write_lock)
+-		ret = eip93_put_descriptor(eip93, cdesc);
++	ret = eip93_put_descriptor(eip93, cdesc);
+ 	if (ret) {
+ 		usleep_range(EIP93_RING_BUSY_DELAY,
+ 			     EIP93_RING_BUSY_DELAY * 2);
+ 		goto again;
+ 	}
+ 
+-	/* Writing new descriptor count starts DMA action */
+-	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
+ }
+ 
+ static int eip93_hash_init(struct ahash_request *req)
+diff --git a/eip93-main.c b/eip93-main.c
+index 9e99a5a..f6360b4 100644
+--- a/eip93-main.c
++++ b/eip93-main.c
+@@ -186,7 +186,7 @@ fail:
+ static void eip93_handle_result_descriptor(struct eip93_device *eip93)
+ {
+ 	struct crypto_async_request *async;
+-	struct eip93_descriptor *rdesc;
++	struct eip93_descriptor rdesc;
+ 	u16 desc_flags, crypto_idr;
+ 	bool last_entry;
+ 	int handled, left, err;
+@@ -207,33 +207,26 @@ get_more:
+ 	last_entry = false;
+ 
+ 	while (left) {
+-		scoped_guard(spinlock_irqsave, &eip93->ring->read_lock)
+-			rdesc = eip93_get_descriptor(eip93);
+-		if (IS_ERR(rdesc)) {
+-			dev_err(eip93->dev, "Ndesc: %d nreq: %d\n",
+-				handled, left);
+-			err = -EIO;
+-			break;
++		err = eip93_get_descriptor(eip93, &rdesc);
++		if (err) {
++			if (err != -EAGAIN)
++				dev_err_ratelimited(eip93->dev, "Ndesc: %d nreq: %d\n",
++						    handled, left);
++			eip93_irq_enable(eip93, EIP93_INT_RDR_THRESH);
++			return;
+ 		}
+-		/* make sure DMA is finished writing */
+-		do {
+-			pe_ctrl_stat = READ_ONCE(rdesc->pe_ctrl_stat_word);
+-			pe_length = READ_ONCE(rdesc->pe_length_word);
+-		} while (FIELD_GET(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN, pe_ctrl_stat) !=
+-			 EIP93_PE_CTRL_PE_READY ||
+-			 FIELD_GET(EIP93_PE_LENGTH_HOST_PE_READY, pe_length) !=
+-			 EIP93_PE_LENGTH_PE_READY);
+-
+-		err = rdesc->pe_ctrl_stat_word & (EIP93_PE_CTRL_PE_EXT_ERR_CODE |
++		pe_ctrl_stat = rdesc.pe_ctrl_stat_word;
++		pe_length = rdesc.pe_length_word;
++
++		err = rdesc.pe_ctrl_stat_word & (EIP93_PE_CTRL_PE_EXT_ERR_CODE |
+ 						  EIP93_PE_CTRL_PE_EXT_ERR |
+ 						  EIP93_PE_CTRL_PE_SEQNUM_ERR |
+ 						  EIP93_PE_CTRL_PE_PAD_ERR |
+ 						  EIP93_PE_CTRL_PE_AUTH_ERR);
+ 
+-		desc_flags = FIELD_GET(EIP93_PE_USER_ID_DESC_FLAGS, rdesc->user_id);
+-		crypto_idr = FIELD_GET(EIP93_PE_USER_ID_CRYPTO_IDR, rdesc->user_id);
++		desc_flags = FIELD_GET(EIP93_PE_USER_ID_DESC_FLAGS, rdesc.user_id);
++		crypto_idr = FIELD_GET(EIP93_PE_USER_ID_CRYPTO_IDR, rdesc.user_id);
+ 
+-		writel(1, eip93->base + EIP93_REG_PE_RD_COUNT);
+ 		eip93_irq_clear(eip93, EIP93_INT_RDR_THRESH);
+ 
+ 		handled++;
+@@ -451,8 +444,7 @@ static int eip93_crypto_probe(struct platform_device *pdev)
+ 
+ 	tasklet_init(&eip93->ring->done_task, eip93_done_task, (unsigned long)eip93);
+ 
+-	spin_lock_init(&eip93->ring->read_lock);
+-	spin_lock_init(&eip93->ring->write_lock);
++	spin_lock_init(&eip93->ring->lock);
+ 
+ 	spin_lock_init(&eip93->ring->idr_lock);
+ 	idr_init(&eip93->ring->crypto_async_idr);
+diff --git a/eip93-main.h b/eip93-main.h
+index 79b078f..e4219f6 100644
+--- a/eip93-main.h
++++ b/eip93-main.h
+@@ -124,8 +124,8 @@ struct eip93_ring {
+ 	/* command/result rings */
+ 	struct eip93_desc_ring		cdr;
+ 	struct eip93_desc_ring		rdr;
+-	spinlock_t			write_lock;
+-	spinlock_t			read_lock;
++	/* Protect both ring pointers, descriptor copies and doorbells. */
++	spinlock_t			lock;
+ 	/* aync idr */
+ 	spinlock_t			idr_lock;
+ 	struct idr			crypto_async_idr;

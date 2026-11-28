@@ -1,0 +1,195 @@
+From b2604df095040381241acdbf866f62167191a274 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:35:33 +0800
+Subject: [PATCH] crypto: eip93 - add an opt-in CTR source-tail alignment
+ experiment
+
+Unaligned direct RFC3686-CTR reads fail at lengths 4..6 and 260..262
+with source offset 1, while lengths 7 and 263 pass. Test whether ending
+the descriptor on a word boundary avoids the input-tail corruption.
+
+Add the default-off skcipher_tail_align parameter. For an out-of-place
+AES CTR request covered by one source entry, extend the processed length
+by up to three bytes using padding already present in that entry. Return
+-EMSGSIZE if that extent or the descriptor length field cannot cover the
+extension. Do not introduce a source copy or enlarge the DMA mapping.
+
+Use private output when extra bytes are processed and retain the original
+logical length for copyback. Compute ordinary CTR's returned IV from the
+logical length, while splitting hardware counter wrap using the extended
+length. This also handles an extension that consumes another AES block.
+The debug trace reports logical and processed lengths separately.
+
+Leave the diagnostic off for normal use. ECB/CBC, authenc, same-table
+in-place requests and multi-entry sources retain their existing paths.
+Physical EIP93 validation is pending; host GCC and the QEMU driver-function
+model validate bounds, output copyback and counter semantics.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-cipher.h |  4 ++++
+ eip93-common.c | 53 ++++++++++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index 5e09f84..1ae48e5 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -8,6 +8,8 @@
+ #ifndef _EIP93_CIPHER_H_
+ #define _EIP93_CIPHER_H_
+ 
++#include <crypto/aes.h>
++
+ #include "eip93-main.h"
+ 
+ struct eip93_crypto_ctx {
+@@ -33,6 +35,8 @@ struct eip93_cipher_reqctx {
+ 	unsigned int			textsize;
+ 	unsigned int			assoclen;
+ 	unsigned int			authsize;
++	u8				tail_bytes;
++	u8				tail_iv[AES_BLOCK_SIZE];
+ 	struct sa_record		*sa_record;
+ 	dma_addr_t			sa_record_base;
+ 	struct sa_state			*sa_state;
+diff --git a/eip93-common.c b/eip93-common.c
+index 8d45551..69e5907 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -45,6 +45,10 @@ static bool skcipher_partial_src;
+ module_param(skcipher_partial_src, bool, 0600);
+ MODULE_PARM_DESC(skcipher_partial_src, "Diagnostic: allow single-entry partial-block CTR sources without copying");
+ 
++static bool skcipher_tail_align;
++module_param(skcipher_tail_align, bool, 0600);
++MODULE_PARM_DESC(skcipher_tail_align, "Diagnostic: align the end of single-entry CTR input using mapped source padding");
++
+ static bool aead_unaligned_src;
+ module_param(aead_unaligned_src, bool, 0600);
+ MODULE_PARM_DESC(aead_unaligned_src, "Diagnostic: bypass authenc source alignment safeguards (known to corrupt data)");
+@@ -319,9 +323,12 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	u32 copy_len;
+ 	unsigned int src_offset = 0, dst_offset = 0;
+ 	bool src_align, dst_align, allow_unaligned;
++	bool tail_align;
+ 	int src_nents, dst_nents;
+ 	int err = -EINVAL;
+ 
++	rctx->tail_bytes = 0;
++
+ 	/*
+ 	 * Allow byte-aligned AES skcipher reads. DES/3DES and authenc need
+ 	 * aligned sources: unaligned authenc input tails have been corrupted
+@@ -366,6 +373,19 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 			return err;
+ 	}
+ 
++	tail_align = !authsize && src != dst && src_nents == 1 &&
++		     IS_AES(rctx->flags) && IS_CTR(rctx->flags) &&
++		     READ_ONCE(skcipher_tail_align);
++	if (tail_align) {
++		u32 extra = -(src->offset + textsize) & 3;
++
++		/* Do not read beyond the source extent supplied by the caller. */
++		if (extra > src->length - textsize ||
++		    textsize > FIELD_MAX(EIP93_PE_LENGTH_LENGTH) - extra)
++			return -EMSGSIZE;
++		rctx->tail_bytes = extra;
++	}
++
+ 	if (authsize) {
+ 		if (dst_nents == 1 && src_nents == 1) {
+ 			src_align = eip93_is_sg_aligned(src, totlen_src, blksize,
+@@ -387,7 +407,8 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 		 * Keep block boundaries between SG entries and all write checks.
+ 		 */
+ 		if (src != dst && src_nents == 1 && IS_AES(rctx->flags) &&
+-		    IS_CTR(rctx->flags) && READ_ONCE(skcipher_partial_src))
++		    IS_CTR(rctx->flags) &&
++		    (tail_align || READ_ONCE(skcipher_partial_src)))
+ 			src_blksize = 1;
+ 		src_align = eip93_is_sg_aligned(src, totlen_src, src_blksize, src == dst,
+ 						allow_unaligned);
+@@ -401,6 +422,10 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	if (authsize && IS_DECRYPT(rctx->flags))
+ 		dst_align = false;
+ 
++	/* Discard extra CTR output instead of writing beyond req->cryptlen. */
++	if (rctx->tail_bytes)
++		dst_align = false;
++
+ 	if (authsize) {
+ 		src_offset = READ_ONCE(aead_src_offset);
+ 		dst_offset = READ_ONCE(aead_dst_offset);
+@@ -410,7 +435,7 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 			dst_align = false;
+ 	}
+ 
+-	copy_len = max(totlen_src, totlen_dst);
++	copy_len = max(totlen_src, totlen_dst) + rctx->tail_bytes;
+ 	if (!src_align) {
+ 		err = eip93_make_sg_copy(src, &rctx->sg_src, copy_len, true, src_offset);
+ 		if (err)
+@@ -669,6 +694,8 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	err = check_valid_request(rctx);
+ 	if (err)
+ 		goto free_sg_copy;
++	datalen += rctx->tail_bytes;
++	split = datalen;
+ 	src = rctx->sg_src;
+ 	dst = rctx->sg_dst;
+ 
+@@ -703,6 +730,17 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	if (IS_ECB(flags))
+ 		goto skip_iv;
+ 
++	if (rctx->tail_bytes && !IS_RFC3686(flags)) {
++		u64 next_ctr = get_unaligned_be32(reqiv + AES_BLOCK_SIZE - sizeof(u32));
++
++		/* The caller's IV advances by the original number of AES blocks. */
++		next_ctr += DIV_ROUND_UP_ULL(rctx->textsize, AES_BLOCK_SIZE);
++		memcpy(rctx->tail_iv, reqiv, AES_BLOCK_SIZE);
++		put_unaligned_be32(next_ctr, rctx->tail_iv + AES_BLOCK_SIZE - sizeof(u32));
++		if (next_ctr >> 32)
++			crypto_inc(rctx->tail_iv, AES_BLOCK_SIZE - sizeof(u32));
++	}
++
+ 	memcpy(iv, reqiv, rctx->ivsize);
+ 
+ 	rctx->sa_state = kzalloc(sizeof(*rctx->sa_state), GFP_KERNEL);
+@@ -721,7 +759,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ 		sa_state->state_iv[3] = (u32 __force)cpu_to_be32(0x1);
+ 	} else if (!IS_HMAC(flags) && IS_CTR(flags)) {
+ 		/* Compute data length. */
+-		blocks = DIV_ROUND_UP(rctx->textsize, AES_BLOCK_SIZE);
++		blocks = DIV_ROUND_UP_ULL(datalen, AES_BLOCK_SIZE);
+ 		ctr = be32_to_cpu((__be32 __force)iv[3]);
+ 		/* Check 32bit counter overflow. */
+ 		start = ctr;
+@@ -800,8 +838,9 @@ skip_iv:
+ 			 readl(eip93->base + EIP93_REG_PE_BUF_THRESH));
+ 	if (!rctx->authsize && READ_ONCE(eip93_skcipher_dma_debug))
+ 		dev_info(eip93->dev,
+-			 "skcipher DMA: id=%d flags=%#x text=%u src=%pad dst=%pad src_map=%u dst_map=%u src_copy=%d dst_copy=%d src_off=%u dst_off=%u src_nents=%d dst_nents=%d dma_cfg=%#x thresholds=%#x\n",
+-			 rctx->request_id, flags, rctx->textsize, &sg_dma_address(src),
++			 "skcipher DMA: id=%d flags=%#x text=%u process=%u tail=%u src=%pad dst=%pad src_map=%u dst_map=%u src_copy=%d dst_copy=%d src_off=%u dst_off=%u src_nents=%d dst_nents=%d dma_cfg=%#x thresholds=%#x\n",
++			 rctx->request_id, flags, rctx->textsize, datalen,
++			 rctx->tail_bytes, &sg_dma_address(src),
+ 			 &sg_dma_address(dst), sg_dma_len(src), sg_dma_len(dst),
+ 			 src != reqsrc, dst != reqdst, src->offset, dst->offset,
+ 			 rctx->src_nents, rctx->dst_nents,
+@@ -923,7 +962,9 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx
+ 				 sizeof(*rctx->sa_state),
+ 				 DMA_BIDIRECTIONAL);
+ 
+-	if (!IS_ECB(rctx->flags)) {
++	if (rctx->tail_bytes && !IS_RFC3686(rctx->flags)) {
++		memcpy(reqiv, rctx->tail_iv, AES_BLOCK_SIZE);
++	} else if (!IS_ECB(rctx->flags)) {
+ 		memcpy(reqiv, rctx->sa_state->state_iv, rctx->ivsize);
+ 		/*
+ 		 * The engine increments only the low 32 counter bits. A wrap
+-- 
+2.52.0
+

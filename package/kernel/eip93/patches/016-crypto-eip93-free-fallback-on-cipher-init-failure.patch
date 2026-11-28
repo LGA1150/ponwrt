@@ -1,0 +1,34 @@
+From b6f2eb9a5411e2a353357b4731b93d536681237f Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 15:13:29 +0800
+Subject: [PATCH] crypto: eip93 - free the fallback if cipher initialization
+ fails
+
+The software fallback is allocated before the SA record. If the latter
+allocation fails, cra_init returns without releasing the fallback; the
+Crypto API does not call cra_exit for a failed initialization.
+
+Free the fallback before returning ENOMEM. crypto_free_skcipher() also
+accepts NULL for algorithms which do not allocate a fallback.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-cipher.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index 82d1a1d..9ce90bb 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -62,8 +62,10 @@ static int eip93_skcipher_cra_init(struct crypto_tfm *tfm)
+ 	ctx->type = tmpl->type;
+ 
+ 	ctx->sa_record = kzalloc(sizeof(*ctx->sa_record), GFP_KERNEL);
+-	if (!ctx->sa_record)
++	if (!ctx->sa_record) {
++		crypto_free_skcipher(ctx->fallback);
+ 		return -ENOMEM;
++	}
+ 
+ 	return 0;
+ }
