@@ -1,0 +1,34 @@
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Subject: [PATCH] tls: add an aligned out-of-place RX experiment
+
+Keep the cloned, potentially fragmented ciphertext as the AEAD input,
+while aligning the private plaintext payload to the DMA cache alignment.
+This opt-in comparison uses rx_inplace=0 rx_aligned_output=1 and avoids
+the private ciphertext copy. It allows DMA-backed AEADs to write directly
+to the plaintext pages if they can handle fragmented input separately.
+
+Default behavior and direct-to-userspace receive are unchanged.
+
+---
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -56,6 +56,10 @@
+ module_param(rx_inplace, bool, 0644);
+ MODULE_PARM_DESC(rx_inplace, "Decrypt buffered async RX records in private aligned buffers");
+ 
++static bool rx_aligned_output;
++module_param(rx_aligned_output, bool, 0644);
++MODULE_PARM_DESC(rx_aligned_output, "Align buffered async RX output without copying ciphertext (rx_inplace=0)");
++
+ struct tls_rx_record {
+ 	struct list_head list;
+ 	struct sk_buff *skb;
+@@ -1694,7 +1698,7 @@
+ 		/* Align the payload, leaving the record header immediately before
+ 		 * it. Subsequent fragments start at page boundaries.
+ 		 */
+-		if (inplace)
++		if (inplace || (ctx->async_capable && READ_ONCE(rx_aligned_output)))
+ 			headroom = ALIGN(prot->prepend_size,
+ 					 dma_get_cache_alignment()) - prot->prepend_size;
+ 
