@@ -1,0 +1,27 @@
+Subject: [PATCH] ktls: allow server-side RX splice
+
+Expose the receive socket to the splice path whenever kernel RX is
+enabled, including connections accepted by a TLS server.
+
+Remove the server-role guard and its warning so the kTLS RX splice path
+can be tested with a TLS-terminating proxy. Keep the kernelRx check and
+existing handling of non-application-data records and read errors.
+
+This removes the restriction for testing; it does not address the
+unspecified failure cited by the old warning.
+
+Based on sing-box v1.14.3.
+
+--- a/common/ktls/ktls.go
++++ b/common/ktls/ktls.go
+@@ -94,10 +94,6 @@ func (c *Conn) SyscallConnForRead() syscall.RawConn {
+ 	if !c.kernelRx {
+ 		return nil
+ 	}
+-	if !*c.rawConn.IsClient {
+-		c.logger.WarnContext(c.ctx, "ktls: RX splice is unavailable on the server size, since it will cause an unknown failure")
+-		return nil
+-	}
+ 	c.logger.DebugContext(c.ctx, "ktls: RX splice requested")
+ 	return c.rawSyscallConn
+ }

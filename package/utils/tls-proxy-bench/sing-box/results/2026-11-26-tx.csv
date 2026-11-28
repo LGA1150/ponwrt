@@ -1,0 +1,18 @@
+# listening=[0.0.0.0]:5001
+# direction=tx connections=2 bytes_per_connection_per_direction=268435456 chunk=16384 runs=5 warmups=1 seed=1708171853 cpu=-1
+# TLS=OpenSSL 3.5.5 27 Jan 2026 verify_certificate=no payload=AES-128-CTR(seed,trial,connection,direction)
+# Timing excludes setup; includes payload generation, transport and byte verification.
+run,direction,connections,bytes_per_connection,seconds,rx_bytes,tx_bytes,rx_gbps,tx_gbps,total_gbps,cpu_seconds,verified
+# warmup=1 tls=TLSv1.3 cipher=TLS_AES_128_GCM_SHA256
+# warmup=1 seconds=5.721438 gbps=0.750680 verified=payload
+# run=1 tls=TLSv1.3 cipher=TLS_AES_128_GCM_SHA256
+1,tx,2,268435456,5.870799,0,536870912,0.000000,0.731581,0.731581,0.770859,payload
+# run=2 tls=TLSv1.3 cipher=TLS_AES_128_GCM_SHA256
+2,tx,2,268435456,5.827052,0,536870912,0.000000,0.737074,0.737074,0.740706,payload
+# run=3 tls=TLSv1.3 cipher=TLS_AES_128_GCM_SHA256
+3,tx,2,268435456,5.870134,0,536870912,0.000000,0.731664,0.731664,0.754734,payload
+# run=4 tls=TLSv1.3 cipher=TLS_AES_128_GCM_SHA256
+4,tx,2,268435456,5.885505,0,536870912,0.000000,0.729753,0.729753,0.742554,payload
+# run=5 tls=TLSv1.3 cipher=TLS_AES_128_GCM_SHA256
+5,tx,2,268435456,5.826030,0,536870912,0.000000,0.737203,0.737203,0.740788,payload
+# PASS gbps min=0.729753 median=0.731664 max=0.737203 aggregate=0.733442 verified=payload
