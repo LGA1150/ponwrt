@@ -1,0 +1,65 @@
+From 99235f8389d6e5a5bbe77306f9760a35b405ac18 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:28:29 +0800
+Subject: [PATCH] crypto: eip93 - add authenc source alignment diagnostics
+
+The skcipher source-offset bypass isolates an intermittent input-tail
+corruption on Airoha: MXBRSTSZ=6 fails, while the same DES replay passes
+with the raw field set to 5. Authenc has not yet been tested with direct
+unaligned sources at that setting.
+
+Add an independent, disabled-by-default aead_unaligned_src parameter for
+the authenc path. It bypasses only the source offset check for requests
+with distinct source and destination SG tables. The existing single-entry
+requirement, block-length checks, destination cache-line isolation and
+private decryption destination remain enforced. In-place requests retain
+their checks, as do requests using explicit source bounce offsets.
+
+Keep the default alignment behavior and DMA settings unchanged. This
+root-only switch is diagnostic; it does not establish that unaligned
+authenc DMA is reliable on the device.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-common.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index bf4d8e1..f257fe5 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -41,6 +41,10 @@ static bool skcipher_unaligned_src;
+ module_param(skcipher_unaligned_src, bool, 0600);
+ MODULE_PARM_DESC(skcipher_unaligned_src, "Diagnostic: allow unaligned read-only skcipher sources (known to corrupt data)");
+ 
++static bool aead_unaligned_src;
++module_param(aead_unaligned_src, bool, 0600);
++MODULE_PARM_DESC(aead_unaligned_src, "Diagnostic: allow unaligned read-only authenc sources (known to corrupt data)");
++
+ static unsigned int aead_src_offset;
+ static unsigned int aead_dst_offset;
+ 
+@@ -311,8 +315,9 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	u32 copy_len;
+ 	unsigned int src_offset = 0, dst_offset = 0;
+ 	bool src_align, dst_align;
+-	bool allow_unaligned = !authsize && src != dst &&
+-			       READ_ONCE(skcipher_unaligned_src);
++	bool allow_unaligned = src != dst &&
++		(authsize ? READ_ONCE(aead_unaligned_src) :
++			    READ_ONCE(skcipher_unaligned_src));
+ 	int src_nents, dst_nents;
+ 	int err = -EINVAL;
+ 
+@@ -353,7 +358,7 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	if (authsize) {
+ 		if (dst_nents == 1 && src_nents == 1) {
+ 			src_align = eip93_is_sg_aligned(src, totlen_src, blksize,
+-							src == dst, false);
++							src == dst, allow_unaligned);
+ 			if (src ==  dst)
+ 				dst_align = src_align;
+ 			else
+-- 
+2.52.0
+

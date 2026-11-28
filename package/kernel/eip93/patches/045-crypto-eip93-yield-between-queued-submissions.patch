@@ -1,0 +1,41 @@
+From 3893f46869e19336b9f5c79efcc55b8b580f0af6 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:32:22 +0800
+Subject: [PATCH] crypto: eip93 - yield between queued submissions
+
+A continuously replenished crypto queue can keep eip93_work running without
+ever exhausting hardware credits or returning to the workqueue core. On
+PREEMPT_NONE this can starve other tasks and RCU quiescent states.
+
+Call cond_resched() after each submission, outside the queue lock and after
+any immediate completion. This preserves pipelining while giving the
+scheduler a chance to run.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-queue.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/eip93-queue.c b/eip93-queue.c
+index 7681b0f..be19aed 100644
+--- a/eip93-queue.c
++++ b/eip93-queue.c
+@@ -2,6 +2,7 @@
+ /* EIP93 software backlog and sleepable, pipelined submission. */
+ 
+ #include <linux/device.h>
++#include <linux/sched.h>
+ 
+ #include "eip93-main.h"
+ #include "eip93-aead.h"
+@@ -52,6 +53,7 @@ static void eip93_work(struct work_struct *work)
+ 		if (err != -EINPROGRESS)
+ 			eip93_complete(async, err);
+ 		/* async may already have completed and been freed. */
++		cond_resched();
+ 	}
+ }
+ 
+-- 
+2.52.0
+

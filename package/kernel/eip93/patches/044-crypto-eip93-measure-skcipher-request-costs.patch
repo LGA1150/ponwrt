@@ -1,0 +1,639 @@
+From 11a879a31dd6ec4443654b272c8ddb08f6b517d4 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:24:21 +0800
+Subject: [PATCH] crypto: eip93 - measure skcipher preparation and descriptor
+ costs
+
+Add default-off aggregate profiling for requests reaching the skcipher
+submission worker. Separate legacy and CTR-SG paths and encrypt/decrypt
+directions, count original SG entries, descriptors, hardware/software
+bytes and private buffers, and time ID allocation, preparation,
+planning, mapping, submission and completion.
+
+Record the last publication timestamp before ringing the doorbell so an
+immediate completion cannot race instrumentation updates. Finish samples
+before invoking the caller, support all-software CTR completion and
+preparation errors, and discard older in-flight samples after a
+generation-based reset. Timings are elapsed nanoseconds, not CPU or
+accelerator busy time.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ Makefile        |   1 +
+ eip93-cipher.c  |  13 +++++-
+ eip93-cipher.h  |   7 +++
+ eip93-common.c  |  92 ++++++++++++++++++++++++++++++++------
+ eip93-profile.c | 115 ++++++++++++++++++++++++++++++++++++++++++++++++
+ eip93-profile.h |  96 ++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 310 insertions(+), 14 deletions(-)
+ create mode 100644 eip93-profile.c
+ create mode 100644 eip93-profile.h
+
+diff --git a/Makefile b/Makefile
+index 0438f16..46577f4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,3 +3,4 @@ obj-$(CONFIG_CRYPTO_DEV_EIP93) += crypto-hw-eip93.o
+ crypto-hw-eip93-y += eip93-main.o eip93-common.o eip93-queue.o
+ crypto-hw-eip93-y += eip93-cipher.o eip93-aead.o
+ crypto-hw-eip93-y += eip93-hash.o
++crypto-hw-eip93-y += eip93-profile.o
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index d463dfb..7e3b5aa 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -33,8 +33,11 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
+ 	if (rctx->ctr_sg) {
+ 		err = eip93_complete_ctr_sg(eip93, req, err);
+ 	} else {
++		eip93_profile_complete(&rctx->profile);
+ 		err = eip93_unmap_dma(eip93, rctx, req->src, req->dst, err);
+ 		eip93_handle_result(eip93, rctx, req->iv);
++		eip93_profile_stage(&rctx->profile, EIP93_P_COMPLETE_NS);
++		eip93_profile_finish(&rctx->profile, err);
+ 	}
+ 
+ 	skcipher_request_complete(req, err);
+@@ -207,9 +210,13 @@ int eip93_skcipher_submit(struct crypto_async_request *async)
+ 	int ret, request_id;
+ 
+ 	/* Reserve completion tracking before any DMA or bounce preparation. */
++	eip93_profile_start(&rctx->profile, req->cryptlen, IS_DECRYPT(rctx->flags));
+ 	request_id = eip93_alloc_req_id(eip93, async);
+-	if (request_id < 0)
++	eip93_profile_stage(&rctx->profile, EIP93_P_ID_NS);
++	if (request_id < 0) {
++		eip93_profile_finish(&rctx->profile, request_id);
+ 		return request_id;
++	}
+ 	rctx->request_id = request_id;
+ 
+ 	rctx->assoclen = 0;
+@@ -226,6 +233,10 @@ int eip93_skcipher_submit(struct crypto_async_request *async)
+ 		return ret;
+ 
+ 	eip93_free_req_id(eip93, request_id);
++	/* An all-software CTR request has already recorded its completion. */
++	eip93_profile_stage(&rctx->profile, rctx->profile.prepared ?
++			    EIP93_P_SUBMIT_NS : EIP93_P_PREPARE_NS);
++	eip93_profile_finish(&rctx->profile, ret);
+ 	return ret;
+ }
+ 
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index 1bc58ac..27443a0 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -11,6 +11,7 @@
+ #include <crypto/aes.h>
+ 
+ #include "eip93-main.h"
++#include "eip93-profile.h"
+ 
+ struct eip93_ctr_plan;
+ 
+@@ -30,6 +31,7 @@ struct eip93_crypto_ctx {
+ };
+ 
+ struct eip93_cipher_reqctx {
++	struct eip93_profile		profile;
+ 	int				request_id;
+ 	u16				desc_flags;
+ 	u16				flags;
+@@ -56,6 +58,11 @@ struct eip93_cipher_reqctx {
+ 	struct skcipher_request		fallback_req;
+ };
+ 
++static inline struct eip93_profile *eip93_cipher_profile(struct eip93_cipher_reqctx *rctx)
++{
++	return rctx->desc_flags & EIP93_DESC_SKCIPHER ? &rctx->profile : NULL;
++}
++
+ int eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 		    struct scatterlist *reqsrc, struct scatterlist *reqdst, int err);
+ 
+diff --git a/eip93-common.c b/eip93-common.c
+index b25c1fc..4a10325 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -174,8 +174,9 @@ static void eip93_ring_advance(struct eip93_desc_ring *ring, void **ptr)
+ 		*ptr += ring->offset;
+ }
+ 
+-void eip93_put_descriptor(struct eip93_device *eip93,
+-			  struct eip93_descriptor *desc)
++static void eip93_put_desc(struct eip93_device *eip93,
++			   struct eip93_descriptor *desc,
++			   struct eip93_profile *profile)
+ {
+ 	struct eip93_desc_ring *cdr = &eip93->ring->cdr;
+ 	struct eip93_desc_ring *rdr = &eip93->ring->rdr;
+@@ -189,11 +190,21 @@ void eip93_put_descriptor(struct eip93_device *eip93,
+ 	eip93_ring_advance(cdr, &cdr->write);
+ 	eip93_ring_advance(rdr, &rdr->write);
+ 
++	eip93_profile_descriptor(profile,
++				 FIELD_GET(EIP93_PE_LENGTH_LENGTH, desc->pe_length_word),
++				 FIELD_GET(EIP93_PE_USER_ID_DESC_FLAGS, desc->user_id) &
++				 EIP93_DESC_LAST);
+ 	/* Publish the descriptor before ringing the doorbell. */
+ 	dma_wmb();
+ 	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
+ }
+ 
++void eip93_put_descriptor(struct eip93_device *eip93,
++			  struct eip93_descriptor *desc)
++{
++	eip93_put_desc(eip93, desc, NULL);
++}
++
+ int eip93_get_descriptor(struct eip93_device *eip93,
+ 			 struct eip93_descriptor *desc)
+ {
+@@ -325,6 +336,7 @@ static bool eip93_ctr_sg_eligible(struct scatterlist *sg, u32 len)
+ 
+ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ {
++	struct eip93_profile *profile = eip93_cipher_profile(rctx);
+ 	struct scatterlist *src = rctx->sg_src;
+ 	struct scatterlist *dst = rctx->sg_dst;
+ 	u32 textsize = rctx->textsize;
+@@ -368,6 +380,8 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	src_nents = sg_nents_for_len(src, totlen_src);
+ 	if (src_nents < 0)
+ 		return src_nents;
++	if (profile && profile->active)
++		profile->value[EIP93_P_SRC_NENTS] = src_nents;
+ 
+ 	dst_nents = sg_nents_for_len(dst, totlen_dst);
+ 	if (dst_nents < 0)
+@@ -695,7 +709,7 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 			dev_info(eip93->dev,
+ 				 "skcipher desc: id=%d index=%u src=%#x dst=%#x len=%u last=%d\n",
+ 				 rctx->request_id, descriptor++, src_addr, dst_addr, len, !n);
+-		eip93_put_descriptor(eip93, cdesc);
++		eip93_put_desc(eip93, cdesc, eip93_cipher_profile(rctx));
+ 	} while (n);
+ 
+ 	return -EINPROGRESS;
+@@ -890,16 +904,22 @@ static int eip93_send_ctr_sg(struct crypto_async_request *async, const u8 *reqiv
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
+ 	struct eip93_device *eip93 = ctx->eip93;
++	struct eip93_profile *profile = &rctx->profile;
+ 	struct scatterlist *reqdst = rctx->sg_dst;
+ 	struct eip93_descriptor desc = {};
+ 	struct eip93_ctr_plan *plan;
+ 	u8 iv[AES_BLOCK_SIZE];
+ 	size_t state_bytes;
+ 	u32 count, left, i;
++	u64 start;
+ 	int mapped, err;
+ 	bool debug = READ_ONCE(eip93_skcipher_dma_debug);
+ 
++	if (profile->active)
++		profile->bucket |= 2;
++	start = eip93_profile_time(profile);
+ 	mapped = dma_map_sg(eip93->dev, rctx->sg_src, rctx->src_nents, DMA_TO_DEVICE);
++	eip93_profile_add(profile, EIP93_P_MAP_NS, start);
+ 	if (!mapped)
+ 		return -ENOMEM;
+ 	err = -ENOMEM;
+@@ -916,14 +936,18 @@ static int eip93_send_ctr_sg(struct crypto_async_request *async, const u8 *reqiv
+ 		memcpy(rctx->tail_iv, iv, sizeof(iv));
+ 		eip93_ctr_add(rctx->tail_iv, DIV_ROUND_UP_ULL(rctx->textsize, AES_BLOCK_SIZE));
+ 	}
++	start = eip93_profile_time(profile);
+ 	err = eip93_plan_ctr_sg(rctx, iv, mapped, plan);
++	eip93_profile_add(profile, EIP93_P_PLAN_NS, start);
+ 	if (err)
+ 		goto free_plan;
+ 	err = -ENOMEM;
+ 	plan->chunks = kcalloc(plan->count, sizeof(*plan->chunks), GFP_KERNEL);
+ 	if (!plan->chunks)
+ 		goto free_plan;
++	start = eip93_profile_time(profile);
+ 	err = eip93_plan_ctr_sg(rctx, iv, mapped, plan);
++	eip93_profile_add(profile, EIP93_P_PLAN_NS, start);
+ 	if (err)
+ 		goto free_chunks;
+ 	err = eip93_make_sg_copy(reqdst, &rctx->sg_dst, plan->output_len, false, 0);
+@@ -932,6 +956,8 @@ static int eip93_send_ctr_sg(struct crypto_async_request *async, const u8 *reqiv
+ 	rctx->dst_nents = 1;
+ 	count = plan->count;
+ 	left = plan->hw_count;
++	if (profile->active)
++		profile->value[EIP93_P_SW_BYTES] = plan->sw_bytes;
+ 	if (debug)
+ 		dev_info(eip93->dev,
+ 			 "skcipher CTR SG: id=%d flags=%#x text=%u process=%u tail=%u sw_bytes=%u output=%u src_copy=0 dst_copy=1 src_nents=%d mapped=%d descriptors=%u dma_cfg=%#x thresholds=%#x\n",
+@@ -940,8 +966,10 @@ static int eip93_send_ctr_sg(struct crypto_async_request *async, const u8 *reqiv
+ 			 plan->output_len, rctx->src_nents, mapped, left,
+ 			 readl(eip93->base + EIP93_REG_PE_DMA_CONFIG),
+ 			 readl(eip93->base + EIP93_REG_PE_BUF_THRESH));
+-	if (!left)
++	if (!left) {
++		eip93_profile_prepared(profile, false, true);
+ 		return eip93_complete_ctr_sg(eip93, skcipher_request_cast(async), 0);
++	}
+ 
+ 	err = -ENOMEM;
+ 	rctx->sa_record = kmemdup(ctx->sa_record, sizeof(*ctx->sa_record), GFP_KERNEL);
+@@ -952,15 +980,25 @@ static int eip93_send_ctr_sg(struct crypto_async_request *async, const u8 *reqiv
+ 	/* Every descriptor has its own logical counter; hardware never updates it. */
+ 	rctx->sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_SAVE_IV;
+ 	state_bytes = (size_t)plan->count * sizeof(*plan->chunks);
++	start = eip93_profile_time(profile);
+ 	plan->dma = dma_map_single(eip93->dev, plan->chunks, state_bytes, DMA_TO_DEVICE);
++	eip93_profile_add(profile, EIP93_P_MAP_NS, start);
+ 	if (dma_mapping_error(eip93->dev, plan->dma))
+ 		goto free_sa;
++	start = eip93_profile_time(profile);
+ 	rctx->sa_record_base = dma_map_single(eip93->dev, rctx->sa_record,
+ 					      sizeof(*rctx->sa_record), DMA_TO_DEVICE);
++	eip93_profile_add(profile, EIP93_P_MAP_NS, start);
+ 	if (dma_mapping_error(eip93->dev, rctx->sa_record_base))
+ 		goto unmap_states;
+-	if (!dma_map_sg(eip93->dev, rctx->sg_dst, 1, DMA_BIDIRECTIONAL))
++	start = eip93_profile_time(profile);
++	err = dma_map_sg(eip93->dev, rctx->sg_dst, 1, DMA_BIDIRECTIONAL);
++	eip93_profile_add(profile, EIP93_P_MAP_NS, start);
++	if (!err) {
++		err = -ENOMEM;
+ 		goto unmap_sa;
++	}
++	eip93_profile_prepared(profile, false, true);
+ 
+ 	desc.pe_ctrl_stat_word = FIELD_PREP(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN,
+ 					    EIP93_PE_CTRL_HOST_READY);
+@@ -991,7 +1029,7 @@ static int eip93_send_ctr_sg(struct crypto_async_request *async, const u8 *reqiv
+ 				 rctx->request_id, i, desc.src_addr, desc.dst_addr,
+ 				 chunk->len, chunk->len + chunk->tail, chunk->tail,
+ 				 chunk->logical, last);
+-		eip93_put_descriptor(eip93, &desc);
++		eip93_put_desc(eip93, &desc, profile);
+ 		/* The final descriptor can complete and free the request immediately. */
+ 		if (last)
+ 			return -EINPROGRESS;
+@@ -1023,7 +1061,9 @@ int eip93_complete_ctr_sg(struct eip93_device *eip93,
+ {
+ 	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
+ 	struct eip93_ctr_plan *plan = rctx->ctr_plan;
++	struct eip93_profile *profile = &rctx->profile;
+ 
++	eip93_profile_complete(profile);
+ 	dma_unmap_sg(eip93->dev, rctx->sg_src, rctx->src_nents, DMA_TO_DEVICE);
+ 	if (plan->hw_count) {
+ 		dma_unmap_sg(eip93->dev, rctx->sg_dst, 1, DMA_BIDIRECTIONAL);
+@@ -1035,9 +1075,12 @@ int eip93_complete_ctr_sg(struct eip93_device *eip93,
+ 	if (!err)
+ 		err = eip93_ctr_sg_software(req);
+ 	if (!err) {
++		u64 start = eip93_profile_time(profile);
++
+ 		if (sg_copy_from_buffer(req->dst, sg_nents(req->dst),
+ 					sg_virt(rctx->sg_dst), rctx->textsize) != rctx->textsize)
+ 			err = -EINVAL;
++		eip93_profile_add(profile, EIP93_P_COPY_NS, start);
+ 		if (!err && !IS_RFC3686(rctx->flags))
+ 			memcpy(req->iv, rctx->tail_iv, AES_BLOCK_SIZE);
+ 	}
+@@ -1048,6 +1091,8 @@ int eip93_complete_ctr_sg(struct eip93_device *eip93,
+ 	kfree(plan);
+ 	rctx->ctr_plan = NULL;
+ 	rctx->sg_dst = req->dst;
++	eip93_profile_stage(profile, EIP93_P_COMPLETE_NS);
++	eip93_profile_finish(profile, err);
+ 	return err;
+ }
+ 
+@@ -1056,6 +1101,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
+ 	struct eip93_device *eip93 = ctx->eip93;
++	struct eip93_profile *profile = eip93_cipher_profile(rctx);
+ 	struct scatterlist *src = rctx->sg_src;
+ 	struct scatterlist *dst = rctx->sg_dst;
+ 	struct scatterlist *reqsrc = src, *reqdst = dst;
+@@ -1063,7 +1109,8 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	struct eip93_descriptor cdesc;
+ 	u32 flags = rctx->flags;
+ 	u32 assoclen = rctx->assoclen;
+-	int offsetin = 0, err;
++	int offsetin = 0, err, mapped;
++	u64 map_start;
+ 	u32 datalen = rctx->assoclen + rctx->textsize;
+ 	u32 split = datalen;
+ 	u32 start, end, ctr, blocks;
+@@ -1103,8 +1150,10 @@ int eip93_send_req(struct crypto_async_request *async,
+ 			rctx->sa_record->sa_cmd1_word &= ~EIP93_SA_CMD_COPY_PAD;
+ 	}
+ 
++	map_start = eip93_profile_time(profile);
+ 	rctx->sa_record_base = dma_map_single(eip93->dev, rctx->sa_record,
+ 					      sizeof(*rctx->sa_record), DMA_TO_DEVICE);
++	eip93_profile_add(profile, EIP93_P_MAP_NS, map_start);
+ 	if (dma_mapping_error(eip93->dev, rctx->sa_record_base)) {
+ 		err = -ENOMEM;
+ 		goto free_sa_record;
+@@ -1166,9 +1215,11 @@ int eip93_send_req(struct crypto_async_request *async,
+ 			memcpy(rctx->sa_state_ctr->state_iv, reqiv, rctx->ivsize);
+ 			memcpy(sa_state->state_iv, iv, rctx->ivsize);
+ 
++			map_start = eip93_profile_time(profile);
+ 			rctx->sa_state_ctr_base = dma_map_single(eip93->dev, rctx->sa_state_ctr,
+ 								 sizeof(*rctx->sa_state_ctr),
+ 								 DMA_BIDIRECTIONAL);
++			eip93_profile_add(profile, EIP93_P_MAP_NS, map_start);
+ 			if (dma_mapping_error(eip93->dev, rctx->sa_state_ctr_base)) {
+ 				err = -ENOMEM;
+ 				goto free_sa_state_ctr;
+@@ -1176,8 +1227,10 @@ int eip93_send_req(struct crypto_async_request *async,
+ 		}
+ 	}
+ 
++	map_start = eip93_profile_time(profile);
+ 	rctx->sa_state_base = dma_map_single(eip93->dev, rctx->sa_state,
+ 					     sizeof(*rctx->sa_state), DMA_BIDIRECTIONAL);
++	eip93_profile_add(profile, EIP93_P_MAP_NS, map_start);
+ 	if (dma_mapping_error(eip93->dev, rctx->sa_state_base)) {
+ 		err = -ENOMEM;
+ 		goto unmap_sa_state_ctr;
+@@ -1198,15 +1251,22 @@ skip_iv:
+ 	/* map DMA_BIDIRECTIONAL to invalidate cache on destination
+ 	 * implies __dma_cache_wback_inv
+ 	 */
+-	if (!dma_map_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL)) {
++	map_start = eip93_profile_time(profile);
++	mapped = dma_map_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL);
++	eip93_profile_add(profile, EIP93_P_MAP_NS, map_start);
++	if (!mapped) {
+ 		err = -ENOMEM;
+ 		goto unmap_sa_state;
+ 	}
+ 
+-	if (src != dst &&
+-	    !dma_map_sg(eip93->dev, src, rctx->src_nents, DMA_TO_DEVICE)) {
+-		err = -ENOMEM;
+-		goto unmap_sg_dst;
++	if (src != dst) {
++		map_start = eip93_profile_time(profile);
++		mapped = dma_map_sg(eip93->dev, src, rctx->src_nents, DMA_TO_DEVICE);
++		eip93_profile_add(profile, EIP93_P_MAP_NS, map_start);
++		if (!mapped) {
++			err = -ENOMEM;
++			goto unmap_sg_dst;
++		}
+ 	}
+ 
+ 	if (rctx->authsize && READ_ONCE(eip93_aead_dma_debug))
+@@ -1230,6 +1290,7 @@ skip_iv:
+ 			 readl(eip93->base + EIP93_REG_PE_DMA_CONFIG),
+ 			 readl(eip93->base + EIP93_REG_PE_BUF_THRESH));
+ 
++	eip93_profile_prepared(profile, src != reqsrc, dst != reqdst);
+ 	err = eip93_scatter_combine(eip93, rctx, datalen, split, offsetin);
+ 	if (err == -EINPROGRESS)
+ 		return err;
+@@ -1323,9 +1384,14 @@ process_tag:
+ 		authsize = 0;
+ 
+ 	if (rctx->sg_dst != reqdst) {
+-		if (!err)
++		if (!err) {
++			struct eip93_profile *profile = eip93_cipher_profile(rctx);
++			u64 start = eip93_profile_time(profile);
++
+ 			sg_copy_from_buffer(reqdst, sg_nents(reqdst),
+ 					    sg_virt(rctx->sg_dst), len + authsize);
++			eip93_profile_add(profile, EIP93_P_COPY_NS, start);
++		}
+ 		eip93_free_sg_copy(len + rctx->authsize, &rctx->sg_dst);
+ 	}
+ 
+diff --git a/eip93-profile.c b/eip93-profile.c
+new file mode 100644
+index 0000000..254c331
+--- /dev/null
++++ b/eip93-profile.c
+@@ -0,0 +1,115 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Optional aggregate skcipher measurements; no per-request logging. */
++#include <linux/moduleparam.h>
++#include <linux/spinlock.h>
++#include <linux/sysfs.h>
++
++#include "eip93-profile.h"
++
++static bool skcipher_profile;
++module_param(skcipher_profile, bool, 0600);
++MODULE_PARM_DESC(skcipher_profile, "Collect skcipher counts and elapsed stage times (default off)");
++
++static unsigned int skcipher_profile_min_bytes = 1024;
++module_param(skcipher_profile_min_bytes, uint, 0600);
++MODULE_PARM_DESC(skcipher_profile_min_bytes, "Minimum logical request size to profile (default 1024)");
++
++static DEFINE_SPINLOCK(profile_lock);
++static u64 profile_generation = 1;
++static u64 profile_totals[4][EIP93_P_FIELDS];
++
++static int eip93_profile_get(char *buf, const struct kernel_param *kp)
++{
++	static const char * const names[] = {
++		"requests", "errors", "bytes", "src_nents", "descriptors",
++		"hw_bytes", "sw_bytes", "src_copies", "dst_copies", "id_ns",
++		"prepare_ns", "plan_ns", "map_ns", "submit_ns", "pending_ns",
++		"complete_ns", "copy_ns",
++	};
++	u64 snapshot[4][EIP93_P_FIELDS], generation;
++	unsigned long flags;
++	int i, j, len;
++
++	static_assert(ARRAY_SIZE(names) == EIP93_P_FIELDS);
++	spin_lock_irqsave(&profile_lock, flags);
++	memcpy(snapshot, profile_totals, sizeof(snapshot));
++	generation = profile_generation;
++	spin_unlock_irqrestore(&profile_lock, flags);
++
++	len = sysfs_emit(buf, "generation=%llu enabled=%u min_bytes=%u\n",
++			 generation, READ_ONCE(skcipher_profile),
++			 READ_ONCE(skcipher_profile_min_bytes));
++	len += sysfs_emit_at(buf, len, "path,direction");
++	for (j = 0; j < EIP93_P_FIELDS; j++)
++		len += sysfs_emit_at(buf, len, ",%s", names[j]);
++	len += sysfs_emit_at(buf, len, "\n");
++	for (i = 0; i < ARRAY_SIZE(snapshot); i++) {
++		len += sysfs_emit_at(buf, len, "%s,%s", i & 2 ? "ctr_sg" : "legacy",
++				     i & 1 ? "decrypt" : "encrypt");
++		for (j = 0; j < EIP93_P_FIELDS; j++)
++			len += sysfs_emit_at(buf, len, ",%llu", snapshot[i][j]);
++		len += sysfs_emit_at(buf, len, "\n");
++	}
++	return len;
++}
++
++static int eip93_profile_reset(const char *val, const struct kernel_param *kp)
++{
++	unsigned long flags;
++	unsigned int reset;
++	int err;
++
++	err = kstrtouint(val, 0, &reset);
++	if (err)
++		return err;
++	if (reset)
++		return -EINVAL;
++
++	spin_lock_irqsave(&profile_lock, flags);
++	profile_generation++;
++	memset(profile_totals, 0, sizeof(profile_totals));
++	spin_unlock_irqrestore(&profile_lock, flags);
++	return 0;
++}
++
++static const struct kernel_param_ops eip93_profile_ops = {
++	.get = eip93_profile_get,
++	.set = eip93_profile_reset,
++};
++module_param_cb(skcipher_profile_stats, &eip93_profile_ops, NULL, 0600);
++MODULE_PARM_DESC(skcipher_profile_stats, "Aggregate skcipher CSV; write 0 to reset, excluding older in-flight samples");
++
++void eip93_profile_start(struct eip93_profile *p, u32 bytes, bool decrypt)
++{
++	unsigned long flags;
++
++	p->active = false;
++	p->prepared = false;
++	if (!READ_ONCE(skcipher_profile) || bytes < READ_ONCE(skcipher_profile_min_bytes))
++		return;
++	memset(p, 0, sizeof(*p));
++	spin_lock_irqsave(&profile_lock, flags);
++	p->generation = profile_generation;
++	spin_unlock_irqrestore(&profile_lock, flags);
++	p->bucket = decrypt;
++	p->value[EIP93_P_BYTES] = bytes;
++	p->active = true;
++	p->stamp = ktime_get_ns();
++}
++
++void eip93_profile_finish(struct eip93_profile *p, int err)
++{
++	unsigned long flags;
++	int i;
++
++	if (!p || !p->active)
++		return;
++	p->active = false;
++	p->value[EIP93_P_REQUESTS] = 1;
++	p->value[EIP93_P_ERRORS] = !!err;
++	spin_lock_irqsave(&profile_lock, flags);
++	if (p->generation == profile_generation)
++		for (i = 0; i < EIP93_P_FIELDS; i++)
++			profile_totals[p->bucket][i] += p->value[i];
++	spin_unlock_irqrestore(&profile_lock, flags);
++}
+diff --git a/eip93-profile.h b/eip93-profile.h
+new file mode 100644
+index 0000000..b56e50e
+--- /dev/null
++++ b/eip93-profile.h
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _EIP93_PROFILE_H_
++#define _EIP93_PROFILE_H_
++
++#include <linux/ktime.h>
++
++enum eip93_profile_field {
++	EIP93_P_REQUESTS,
++	EIP93_P_ERRORS,
++	EIP93_P_BYTES,
++	EIP93_P_SRC_NENTS,
++	EIP93_P_DESCRIPTORS,
++	EIP93_P_HW_BYTES,
++	EIP93_P_SW_BYTES,
++	EIP93_P_SRC_COPIES,
++	EIP93_P_DST_COPIES,
++	EIP93_P_ID_NS,
++	EIP93_P_PREPARE_NS,
++	EIP93_P_PLAN_NS,
++	EIP93_P_MAP_NS,
++	EIP93_P_SUBMIT_NS,
++	EIP93_P_PENDING_NS,
++	EIP93_P_COMPLETE_NS,
++	EIP93_P_COPY_NS,
++	EIP93_P_FIELDS,
++};
++
++struct eip93_profile {
++	u64 value[EIP93_P_FIELDS];
++	u64 stamp;
++	u64 generation;
++	u8 bucket;
++	bool active;
++	bool prepared;
++};
++
++void eip93_profile_start(struct eip93_profile *p, u32 bytes, bool decrypt);
++void eip93_profile_finish(struct eip93_profile *p, int err);
++
++static inline u64 eip93_profile_time(const struct eip93_profile *p)
++{
++	return p && p->active ? ktime_get_ns() : 0;
++}
++
++static inline void eip93_profile_add(struct eip93_profile *p,
++				     enum eip93_profile_field field, u64 start)
++{
++	if (p && p->active)
++		p->value[field] += ktime_get_ns() - start;
++}
++
++static inline void eip93_profile_stage(struct eip93_profile *p,
++				       enum eip93_profile_field field)
++{
++	u64 now = eip93_profile_time(p);
++
++	if (p && p->active) {
++		p->value[field] += now - p->stamp;
++		p->stamp = now;
++	}
++}
++
++static inline void eip93_profile_prepared(struct eip93_profile *p,
++					  bool src_copy, bool dst_copy)
++{
++	if (!p || !p->active)
++		return;
++	p->value[EIP93_P_SRC_COPIES] = src_copy;
++	p->value[EIP93_P_DST_COPIES] = dst_copy;
++	eip93_profile_stage(p, EIP93_P_PREPARE_NS);
++	p->prepared = true;
++}
++
++/* Called before the doorbell: the last descriptor may free the request. */
++static inline void eip93_profile_descriptor(struct eip93_profile *p,
++					    u32 bytes, bool last)
++{
++	if (!p || !p->active)
++		return;
++	p->value[EIP93_P_DESCRIPTORS]++;
++	p->value[EIP93_P_HW_BYTES] += bytes;
++	if (last)
++		eip93_profile_stage(p, EIP93_P_SUBMIT_NS);
++}
++
++static inline void eip93_profile_complete(struct eip93_profile *p)
++{
++	if (!p || !p->active)
++		return;
++	if (p->value[EIP93_P_DESCRIPTORS])
++		eip93_profile_stage(p, EIP93_P_PENDING_NS);
++	else
++		p->stamp = ktime_get_ns();
++}
++
++#endif /* _EIP93_PROFILE_H_ */
+-- 
+2.52.0
+

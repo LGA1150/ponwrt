@@ -1,0 +1,472 @@
+From d5545778a8e71474d5ac3fd6d0d8158a557e6656 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:14:42 +0800
+Subject: [PATCH] crypto: eip93 - add GCM with payload-only bulk CTR
+
+Generic GCM prepends a 16-byte tag-mask block to the CTR scatterlists.
+EIP93's DMA write-alignment checks then bounce otherwise aligned in-place
+payloads. A partial final block can also force full-record bounce buffers.
+
+Register gcm-aes-eip93 using the existing hardware CTR driver and a
+synchronous GHASH transform. Compute AES_K(J0) separately in software,
+submit only whole DMA-cache-line payload extents to CTR from counter 2,
+and handle the remaining bytes in software. Slice SG metadata without
+modifying caller lists or mapping AAD, authentication tags or the CPU tail.
+Use request-local SG storage for the common one/two-entry case.
+
+Authenticate RX ciphertext before decryption so a bad tag cannot overwrite
+in-place input. Compute the TX tag after CTR completion. Preserve accepted
+backlog, early callbacks, synchronous completion and terminal error rules.
+Restrict hardware key-size adjustment to skcipher templates now that a
+non-authenc AES AEAD is present in the registration table.
+
+Aligned private in-place buffers can use the existing direct DMA path.
+Misaligned/fragmented requests retain the child's bounce and CTR controls.
+This does not change kTLS allocations or overwrite cloned TCP buffers.
+
+Validation: host GCC W=1; 5,176 QEMU differential cases across synchronous,
+BH asynchronous, backlog and callback-before-return CTR fixtures; 16
+requests in flight and submission/completion errors; both TLS versions and
+all recv/send/splice directions with an asynchronous software CTR child.
+Hardware DMA correctness and performance need device testing.
+
+OpenAI Codex assisted with implementation, validation and this changelog.
+---
+ Makefile     |   1 +
+ eip93-gcm.c  | 378 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ eip93-main.c |   4 +-
+ eip93-main.h |   2 +
+ 4 files changed, 384 insertions(+), 1 deletion(-)
+ create mode 100644 eip93-gcm.c
+
+diff --git a/Makefile b/Makefile
+index 46577f4..0215081 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,3 +4,4 @@ crypto-hw-eip93-y += eip93-main.o eip93-common.o eip93-queue.o
+ crypto-hw-eip93-y += eip93-cipher.o eip93-aead.o
+ crypto-hw-eip93-y += eip93-hash.o
+ crypto-hw-eip93-y += eip93-profile.o
++crypto-hw-eip93-y += eip93-gcm.o
+diff --git a/eip93-gcm.c b/eip93-gcm.c
+new file mode 100644
+index 0000000..ff68604
+--- /dev/null
++++ b/eip93-gcm.c
+@@ -0,0 +1,378 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <crypto/aes.h>
++#include <crypto/gcm.h>
++#include <crypto/hash.h>
++#include <crypto/internal/aead.h>
++#include <crypto/scatterwalk.h>
++#include <linux/dma-mapping.h>
++#include <linux/overflow.h>
++#include <linux/sched.h>
++#include <linux/unaligned.h>
++
++#include "eip93-main.h"
++
++struct eip93_gcm_ctx {
++	struct crypto_skcipher *ctr;
++	struct crypto_shash *ghash;
++	struct crypto_aes_ctx aes;
++};
++
++struct eip93_gcm_reqctx {
++	struct sg_table src;
++	struct sg_table dst;
++	struct scatterlist src_sg[2];
++	struct scatterlist dst_sg[2];
++	unsigned int cryptlen;
++	unsigned int bulk;
++	bool decrypt;
++	u8 iv[AES_BLOCK_SIZE];
++	struct skcipher_request ctr;
++};
++
++/* Clip both ends: the child must not map the AAD, tag or caller's tail. */
++static int eip93_gcm_sg_slice(struct sg_table *table, struct scatterlist *inline_sg,
++			      struct scatterlist *sg,
++			      unsigned int skip, unsigned int len, gfp_t gfp)
++{
++	struct scatterlist *first, *dst;
++	unsigned int offset, remaining = len, nents = 0;
++	int err;
++
++	while (sg && skip >= sg->length) {
++		skip -= sg->length;
++		sg = sg_next(sg);
++	}
++	first = sg;
++	offset = skip;
++	while (sg && remaining) {
++		unsigned int n = min(remaining, sg->length - skip);
++
++		if (n)
++			nents++;
++		remaining -= n;
++		skip = 0;
++		sg = sg_next(sg);
++	}
++	if (remaining || !nents)
++		return -EINVAL;
++	if (nents <= 2) {
++		table->sgl = inline_sg;
++		table->nents = nents;
++		table->orig_nents = nents;
++		sg_init_table(table->sgl, nents);
++	} else {
++		err = sg_alloc_table(table, nents, gfp);
++		if (err) {
++			table->sgl = NULL;
++			return err;
++		}
++	}
++
++	dst = table->sgl;
++	for (sg = first; len; sg = sg_next(sg), offset = 0) {
++		unsigned int n = min(len, sg->length - offset);
++
++		if (!n)
++			continue;
++		sg_set_page(dst, sg_page(sg), n, sg->offset + offset);
++		len -= n;
++		dst = sg_next(dst);
++	}
++	return 0;
++}
++
++static int eip93_gcm_hash_sg(struct shash_desc *desc, struct scatterlist *sg,
++			     unsigned int skip, unsigned int len, u32 flags)
++{
++	struct scatter_walk walk;
++	int err;
++
++	if (!len)
++		return 0;
++	scatterwalk_start_at_pos(&walk, sg, skip);
++	while (len) {
++		unsigned int n = scatterwalk_next(&walk, len);
++
++		err = crypto_shash_update(desc, walk.addr, n);
++		scatterwalk_done_src(&walk, n);
++		if (err)
++			return err;
++		len -= n;
++		if (flags & CRYPTO_TFM_REQ_MAY_SLEEP)
++			cond_resched();
++	}
++	return 0;
++}
++
++static int eip93_gcm_tag(struct aead_request *req, u8 *tag, u32 flags)
++{
++	struct eip93_gcm_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
++	struct eip93_gcm_reqctx *rctx = aead_request_ctx(req);
++	struct scatterlist *text = rctx->decrypt ? req->src : req->dst;
++	SHASH_DESC_ON_STACK(desc, ctx->ghash);
++	u8 mask[AES_BLOCK_SIZE];
++	u8 block[AES_BLOCK_SIZE] = {};
++	int err;
++
++	desc->tfm = ctx->ghash;
++	err = crypto_shash_init(desc);
++	if (err)
++		goto out;
++	err = eip93_gcm_hash_sg(desc, req->src, 0, req->assoclen, flags);
++	if (err)
++		goto out;
++	if (req->assoclen % AES_BLOCK_SIZE) {
++		err = crypto_shash_update(desc, block,
++					  AES_BLOCK_SIZE - req->assoclen % AES_BLOCK_SIZE);
++		if (err)
++			goto out;
++	}
++	err = eip93_gcm_hash_sg(desc, text, req->assoclen, rctx->cryptlen, flags);
++	if (err)
++		goto out;
++	if (rctx->cryptlen % AES_BLOCK_SIZE) {
++		err = crypto_shash_update(desc, block,
++					  AES_BLOCK_SIZE - rctx->cryptlen % AES_BLOCK_SIZE);
++		if (err)
++			goto out;
++	}
++	put_unaligned_be64((u64)req->assoclen * 8, block);
++	put_unaligned_be64((u64)rctx->cryptlen * 8, block + 8);
++	err = crypto_shash_finup(desc, block, sizeof(block), tag);
++	if (err)
++		goto out;
++
++	/* E(K, J0) is separate from bulk CTR, which starts at inc32(J0). */
++	memcpy(block, req->iv, GCM_AES_IV_SIZE);
++	put_unaligned_be32(1, block + GCM_AES_IV_SIZE);
++	aes_encrypt(&ctx->aes, mask, block);
++	crypto_xor(tag, mask, AES_BLOCK_SIZE);
++out:
++	shash_desc_zero(desc);
++	memzero_explicit(mask, sizeof(mask));
++	memzero_explicit(block, sizeof(block));
++	return err;
++}
++
++static int eip93_gcm_finish(struct aead_request *req, int err, u32 flags)
++{
++	struct crypto_aead *aead = crypto_aead_reqtfm(req);
++	struct eip93_gcm_ctx *ctx = crypto_aead_ctx(aead);
++	struct eip93_gcm_reqctx *rctx = aead_request_ctx(req);
++	unsigned int offset = rctx->bulk;
++	u8 block[AES_BLOCK_SIZE], stream[AES_BLOCK_SIZE];
++	u8 counter[AES_BLOCK_SIZE];
++
++	if (err)
++		return err;
++	memcpy(counter, req->iv, GCM_AES_IV_SIZE);
++	while (offset < rctx->cryptlen) {
++		unsigned int n = min_t(unsigned int, AES_BLOCK_SIZE,
++					 rctx->cryptlen - offset);
++
++		put_unaligned_be32(2 + offset / AES_BLOCK_SIZE,
++				   counter + GCM_AES_IV_SIZE);
++		aes_encrypt(&ctx->aes, stream, counter);
++		scatterwalk_map_and_copy(block, req->src, req->assoclen + offset, n, 0);
++		crypto_xor(block, stream, n);
++		scatterwalk_map_and_copy(block, req->dst, req->assoclen + offset, n, 1);
++		offset += n;
++	}
++	if (!rctx->decrypt) {
++		err = eip93_gcm_tag(req, block, flags);
++		if (!err)
++			scatterwalk_map_and_copy(block, req->dst,
++						 req->assoclen + rctx->cryptlen,
++						 crypto_aead_authsize(aead), 1);
++	}
++	memzero_explicit(counter, sizeof(counter));
++	memzero_explicit(stream, sizeof(stream));
++	memzero_explicit(block, sizeof(block));
++	return err;
++}
++
++static void eip93_gcm_free_sg(struct eip93_gcm_reqctx *rctx)
++{
++	if (rctx->dst.sgl && rctx->dst.sgl != rctx->dst_sg)
++		sg_free_table(&rctx->dst);
++	if (rctx->src.sgl && rctx->src.sgl != rctx->src_sg)
++		sg_free_table(&rctx->src);
++}
++
++static void eip93_gcm_done(void *data, int err)
++{
++	struct aead_request *req = data;
++	struct eip93_gcm_reqctx *rctx = aead_request_ctx(req);
++
++	if (err == -EINPROGRESS) {
++		aead_request_complete(req, err);
++		return;
++	}
++	eip93_gcm_free_sg(rctx);
++	err = eip93_gcm_finish(req, err, 0);
++	aead_request_complete(req, err);
++}
++
++static int eip93_gcm_crypt(struct aead_request *req, bool decrypt)
++{
++	struct crypto_aead *aead = crypto_aead_reqtfm(req);
++	struct eip93_gcm_ctx *ctx = crypto_aead_ctx(aead);
++	struct eip93_gcm_reqctx *rctx = aead_request_ctx(req);
++	unsigned int authsize = crypto_aead_authsize(aead);
++	unsigned int align = max_t(unsigned int, AES_BLOCK_SIZE,
++				   dma_get_cache_alignment());
++	unsigned int src_len, dst_len;
++	u32 flags = req->base.flags;
++	gfp_t gfp = flags & CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL : GFP_ATOMIC;
++	u8 tag[AES_BLOCK_SIZE], expected[AES_BLOCK_SIZE];
++	int err;
++
++	if (decrypt && req->cryptlen < authsize)
++		return -EINVAL;
++	if (check_add_overflow(req->assoclen, req->cryptlen, &src_len))
++		return -EINVAL;
++	dst_len = src_len;
++	if (decrypt)
++		dst_len -= authsize;
++	else if (check_add_overflow(dst_len, authsize, &dst_len))
++		return -EINVAL;
++	if ((src_len && sg_nents_for_len(req->src, src_len) < 0) ||
++	    (dst_len && sg_nents_for_len(req->dst, dst_len) < 0))
++		return -EINVAL;
++
++	rctx->src.sgl = NULL;
++	rctx->dst.sgl = NULL;
++	rctx->decrypt = decrypt;
++	rctx->cryptlen = req->cryptlen - (decrypt ? authsize : 0);
++	/* Leave the final cache line to the CPU, including any partial block. */
++	rctx->bulk = round_down(rctx->cryptlen, align);
++	if (decrypt) {
++		/* Authenticate ciphertext before an in-place request overwrites it. */
++		err = eip93_gcm_tag(req, tag, flags);
++		if (!err) {
++			scatterwalk_map_and_copy(expected, req->src, dst_len, authsize, 0);
++			if (crypto_memneq(tag, expected, authsize))
++				err = -EBADMSG;
++		}
++		memzero_explicit(tag, sizeof(tag));
++		memzero_explicit(expected, sizeof(expected));
++		if (err)
++			return err;
++	}
++	if (!rctx->bulk)
++		return eip93_gcm_finish(req, 0, flags);
++
++	err = eip93_gcm_sg_slice(&rctx->src, rctx->src_sg, req->src,
++				 req->assoclen, rctx->bulk, gfp);
++	if (err)
++		return err;
++	if (req->src != req->dst) {
++		err = eip93_gcm_sg_slice(&rctx->dst, rctx->dst_sg, req->dst, req->assoclen,
++					 rctx->bulk, gfp);
++		if (err)
++			goto out;
++	}
++	memcpy(rctx->iv, req->iv, GCM_AES_IV_SIZE);
++	put_unaligned_be32(2, rctx->iv + GCM_AES_IV_SIZE);
++	skcipher_request_set_tfm(&rctx->ctr, ctx->ctr);
++	skcipher_request_set_callback(&rctx->ctr, flags, eip93_gcm_done, req);
++	skcipher_request_set_crypt(&rctx->ctr, rctx->src.sgl,
++				   rctx->dst.sgl ?: rctx->src.sgl, rctx->bulk, rctx->iv);
++	err = decrypt ? crypto_skcipher_decrypt(&rctx->ctr) :
++			crypto_skcipher_encrypt(&rctx->ctr);
++	/* Completion may already have freed req by the time submission returns. */
++	if (err == -EINPROGRESS || (err == -EBUSY && flags & CRYPTO_TFM_REQ_MAY_BACKLOG))
++		return err;
++out:
++	eip93_gcm_free_sg(rctx);
++	return eip93_gcm_finish(req, err, flags);
++}
++
++static int eip93_gcm_encrypt(struct aead_request *req)
++{
++	return eip93_gcm_crypt(req, false);
++}
++
++static int eip93_gcm_decrypt(struct aead_request *req)
++{
++	return eip93_gcm_crypt(req, true);
++}
++
++static int eip93_gcm_setkey(struct crypto_aead *aead, const u8 *key, unsigned int len)
++{
++	struct eip93_gcm_ctx *ctx = crypto_aead_ctx(aead);
++	u8 hash[AES_BLOCK_SIZE] = {};
++	int err;
++
++	err = aes_expandkey(&ctx->aes, key, len);
++	if (err)
++		return err;
++	crypto_skcipher_clear_flags(ctx->ctr, CRYPTO_TFM_REQ_MASK);
++	crypto_skcipher_set_flags(ctx->ctr, crypto_aead_get_flags(aead) &
++				 CRYPTO_TFM_REQ_MASK);
++	err = crypto_skcipher_setkey(ctx->ctr, key, len);
++	if (err)
++		return err;
++	aes_encrypt(&ctx->aes, hash, hash);
++	err = crypto_shash_setkey(ctx->ghash, hash, sizeof(hash));
++	memzero_explicit(hash, sizeof(hash));
++	return err;
++}
++
++static int eip93_gcm_setauthsize(struct crypto_aead *aead, unsigned int authsize)
++{
++	return crypto_gcm_check_authsize(authsize);
++}
++
++static int eip93_gcm_init(struct crypto_aead *aead)
++{
++	struct eip93_gcm_ctx *ctx = crypto_aead_ctx(aead);
++	int err;
++
++	ctx->ghash = crypto_alloc_shash("ghash", 0, 0);
++	if (IS_ERR(ctx->ghash))
++		return PTR_ERR(ctx->ghash);
++	ctx->ctr = crypto_alloc_skcipher("ctr(aes-eip93)", 0, 0);
++	if (IS_ERR(ctx->ctr)) {
++		err = PTR_ERR(ctx->ctr);
++		crypto_free_shash(ctx->ghash);
++		return err;
++	}
++	crypto_aead_set_reqsize(aead, sizeof(struct eip93_gcm_reqctx) +
++				crypto_skcipher_reqsize(ctx->ctr));
++	return 0;
++}
++
++static void eip93_gcm_exit(struct crypto_aead *aead)
++{
++	struct eip93_gcm_ctx *ctx = crypto_aead_ctx(aead);
++
++	crypto_free_skcipher(ctx->ctr);
++	crypto_free_shash(ctx->ghash);
++	memzero_explicit(&ctx->aes, sizeof(ctx->aes));
++}
++
++struct eip93_alg_template eip93_alg_gcm_aes = {
++	.type = EIP93_ALG_TYPE_AEAD,
++	.flags = EIP93_ALG_AES,
++	.alg.aead = {
++		.init = eip93_gcm_init,
++		.exit = eip93_gcm_exit,
++		.setkey = eip93_gcm_setkey,
++		.setauthsize = eip93_gcm_setauthsize,
++		.encrypt = eip93_gcm_encrypt,
++		.decrypt = eip93_gcm_decrypt,
++		.ivsize = GCM_AES_IV_SIZE,
++		.maxauthsize = AES_BLOCK_SIZE,
++		.chunksize = AES_BLOCK_SIZE,
++		.base = {
++			.cra_name = "gcm(aes)",
++			.cra_driver_name = "gcm-aes-eip93",
++			.cra_priority = EIP93_CRA_PRIORITY + 1,
++			.cra_flags = CRYPTO_ALG_ASYNC,
++			.cra_blocksize = 1,
++			.cra_ctxsize = sizeof(struct eip93_gcm_ctx),
++			.cra_module = THIS_MODULE,
++		},
++	},
++};
+diff --git a/eip93-main.c b/eip93-main.c
+index bcb707f..e6435b2 100644
+--- a/eip93-main.c
++++ b/eip93-main.c
+@@ -84,6 +84,7 @@ static struct eip93_alg_template *eip93_algs[] = {
+ 	&eip93_alg_authenc_hmac_sha1_rfc3686_aes,
+ 	&eip93_alg_authenc_hmac_sha224_rfc3686_aes,
+ 	&eip93_alg_authenc_hmac_sha256_rfc3686_aes,
++	&eip93_alg_gcm_aes,
+ };
+ 
+ inline void eip93_irq_disable(struct eip93_device *eip93, u32 mask)
+@@ -166,7 +167,8 @@ static int eip93_register_algs(struct eip93_device *eip93, u32 supported_algo_fl
+ 		if (!eip93_algo_is_supported(alg_flags, supported_algo_flags))
+ 			continue;
+ 
+-		if (IS_AES(alg_flags) && !IS_HMAC(alg_flags)) {
++		if (eip93_algs[i]->type == EIP93_ALG_TYPE_SKCIPHER &&
++		    IS_AES(alg_flags)) {
+ 			if (supported_algo_flags & EIP93_PE_OPTION_AES_KEY128)
+ 				eip93_algs[i]->alg.skcipher.max_keysize =
+ 					AES_KEYSIZE_128;
+diff --git a/eip93-main.h b/eip93-main.h
+index cd1c570..3edcb32 100644
+--- a/eip93-main.h
++++ b/eip93-main.h
+@@ -168,6 +168,8 @@ struct eip93_alg_template {
+ 	} alg;
+ };
+ 
++extern struct eip93_alg_template eip93_alg_gcm_aes;
++
+ int eip93_queue_init(struct eip93_device *eip93);
+ void eip93_queue_exit(struct eip93_device *eip93);
+ int eip93_enqueue(struct eip93_device *eip93, struct crypto_async_request *async);
+-- 
+2.52.0
+

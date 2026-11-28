@@ -1,0 +1,62 @@
+From 2c4c91ec02219e2e3fd8679582c8613bde7d3b7e Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 14:32:52 +0800
+Subject: [PATCH] crypto: eip93 - add a direct partial CTR source diagnostic
+
+A 260-byte RFC3686 skcipher request passes the plain-cipher/authenc
+comparison, but its DMA trace shows src_copy=1 and a 320-byte aligned
+mapping. The skcipher context retains AES_BLOCK_SIZE for SG validation,
+so the final non-block-multiple source length forces a copy. Native
+RFC3686 authenc instead uses a one-byte block size. The skcipher pass
+therefore does not exclude the same unaligned input-tail corruption.
+
+Add the default-off skcipher_partial_src diagnostic. For an out-of-place
+AES CTR skcipher request contained in one source SG entry, let the read
+length have byte granularity. Preserve the descriptor's exact crypt
+length, destination checks, in-place checks and multi-entry SG block
+boundaries. CBC, ECB and authenc validation are unchanged.
+
+This provides a direct-source control for the DMA investigation. It is
+not a hardware fix or a change to the normal alignment policy.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-common.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index dd081f6..8d45551 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -41,6 +41,10 @@ static bool skcipher_unaligned_src;
+ module_param(skcipher_unaligned_src, bool, 0600);
+ MODULE_PARM_DESC(skcipher_unaligned_src, "Diagnostic: bypass DES/3DES source alignment checks (known to corrupt data)");
+ 
++static bool skcipher_partial_src;
++module_param(skcipher_partial_src, bool, 0600);
++MODULE_PARM_DESC(skcipher_partial_src, "Diagnostic: allow single-entry partial-block CTR sources without copying");
++
+ static bool aead_unaligned_src;
+ module_param(aead_unaligned_src, bool, 0600);
+ MODULE_PARM_DESC(aead_unaligned_src, "Diagnostic: bypass authenc source alignment safeguards (known to corrupt data)");
+@@ -376,7 +380,16 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 			dst_align = false;
+ 		}
+ 	} else {
+-		src_align = eip93_is_sg_aligned(src, totlen_src, blksize, src == dst,
++		u32 src_blksize = blksize;
++
++		/*
++		 * Permit a direct partial-block CTR read for DMA diagnosis.
++		 * Keep block boundaries between SG entries and all write checks.
++		 */
++		if (src != dst && src_nents == 1 && IS_AES(rctx->flags) &&
++		    IS_CTR(rctx->flags) && READ_ONCE(skcipher_partial_src))
++			src_blksize = 1;
++		src_align = eip93_is_sg_aligned(src, totlen_src, src_blksize, src == dst,
+ 						allow_unaligned);
+ 		if (src == dst)
+ 			dst_align = src_align;
+-- 
+2.52.0
+

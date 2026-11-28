@@ -1,0 +1,41 @@
+{
+  "log": {
+    "level": "debug"
+  },
+  "inbounds": [
+    {
+      "type": "trojan",
+      "tag": "benchmark",
+      "listen": "192.0.2.20",
+      "listen_port": 8444,
+      "users": [
+        {
+          "name": "unused",
+          "password": "benchmark-only"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "min_version": "1.3",
+        "max_version": "1.3",
+        "certificate_path": "/tmp/ktls/haproxy/server.crt.pem",
+        "key_path": "/tmp/ktls/haproxy/server.key.pem",
+        "kernel_tx": true,
+        "kernel_rx": true
+      },
+      "fallback": {
+        "server": "192.0.2.10",
+        "server_port": 5001
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

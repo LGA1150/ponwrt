@@ -1,0 +1,59 @@
+From 0516b6849db3b99554e457486e544f5a1eda3ea3 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:34:28 +0800
+Subject: [PATCH] crypto: eip93 - align authenc sources at every message length
+
+Limiting authenc source bouncing to inputs below eight bytes still exposes
+intermittent corruption in larger requests. On AN7581 with raw MXBRSTSZ 6
+and 64/64 buffer thresholds, SHA224/RFC3686 case 740 corrupts the final
+three payload bytes and its four-byte tag. The input has 65 bytes of AAD,
+16385 bytes of payload and a source offset of one. The destination already
+uses an aligned bounce buffer.
+
+Restore word-aligned sources for all native authenc lengths. Keep the
+diagnostic bypass off by default. This is a source-buffer workaround;
+the precise cause of the observed DMA corruption is still unconfirmed.
+
+Retain byte-aligned read-only AES skcipher sources, the DES/3DES guard,
+the raw-6 burst default and the disabled size-based AES fallback. Cipher
+and hash computation still use the accelerator for eligible authenc
+requests after the source copy.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-common.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/eip93-common.c b/eip93-common.c
+index c34d9cc..b605c33 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -280,7 +280,7 @@ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+ 
+ 		/*
+ 		 * DMA-written buffers must not share cache lines with CPU writes.
+-		 * Read-only sources follow the cipher and short-message policy.
++		 * Read-only sources follow the cipher and authenc alignment policy.
+ 		 * dma_map_sg() maps the entire entry, including any bytes beyond
+ 		 * the requested crypt length in the last entry.
+ 		 */
+@@ -319,12 +319,11 @@ static int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	int err = -EINVAL;
+ 
+ 	/*
+-	 * Allow byte-aligned AES reads, but keep DES/3DES sources aligned.
+-	 * Short authenc inputs can span only partial words: require aligned
+-	 * sources below two words, using AAD plus payload before adding the tag.
++	 * Allow byte-aligned AES skcipher reads. DES/3DES and authenc need
++	 * aligned sources: unaligned authenc input tails have been corrupted
++	 * for both short and long messages.
+ 	 */
+-	allow_unaligned = IS_AES(rctx->flags) &&
+-			  (!authsize || totlen_src >= 2 * sizeof(u32));
++	allow_unaligned = IS_AES(rctx->flags) && !authsize;
+ 	if (src != dst)
+ 		allow_unaligned |= authsize ? READ_ONCE(aead_unaligned_src) :
+ 					     READ_ONCE(skcipher_unaligned_src);
+-- 
+2.52.0
+

@@ -1,0 +1,47 @@
+From 97f40f2fff0425f589970d33ec87d93a66484c7f Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:24:05 +0800
+Subject: [PATCH] tls: Reject exhausted TX record sequences before async
+ encryption
+
+Submitting encryption before detecting record sequence exhaustion lets
+an asynchronous completion race tls_advance_record_sn(). Depending on
+when the callback observes sk_err, the same send can report success or
+EBADMSG. The existing tls_basic.recseq_wrap selftest expects EBADMSG and
+failed 9 of 30 runs with pcrypt on the previous kernel.
+
+Reject an all-ones sequence before submitting the AEAD request. The
+existing push failure path aborts the socket and frees the open record,
+without a callback racing the exhaustion error.
+
+Validation: the existing recseq_wrap selftest passed 30 consecutive
+pcrypt runs in QEMU TCG with KASAN and lockdep. The focused TLS suite
+passed 117 tests; kernel builds, diff checks and checkpatch passed.
+
+OpenAI Codex assisted with diagnosis, implementation, validation and this
+changelog while extending asynchronous kTLS I/O coverage.
+
+Fixes: a42055e8d2c3 ("net/tls: Add support for async encryption of records for performance")
+(cherry picked from commit 0721fa685170f0e4cf8ac390003e07c681dced40)
+---
+ net/tls/tls_sw.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index 5479db1728f6..c1b7ebe454b6 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -598,6 +598,13 @@ static int tls_do_encryption(struct sock *sk,
+ 	struct scatterlist *sge = sk_msg_elem(msg_en, start);
+ 	int rc, iv_offset = 0;
+ 
++	/* Reject exhaustion before handing the record to an async cipher.
++	 * Otherwise tls_advance_record_sn() races the completion callback:
++	 * send may succeed or fail depending on when sk_err becomes visible.
++	 */
++	if (!memchr_inv(tls_ctx->tx.rec_seq, 0xff, prot->rec_seq_size))
++		return -EBADMSG;
++
+ 	/* For CCM based ciphers, first byte of IV is a constant */
+ 	switch (prot->cipher_type) {
+ 	case TLS_CIPHER_AES_CCM_128:

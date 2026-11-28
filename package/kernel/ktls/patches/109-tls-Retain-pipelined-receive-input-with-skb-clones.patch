@@ -1,0 +1,138 @@
+From 839a07831db08ad24a9da1953ce64cbd04a3bd11 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:58:52 +0800
+Subject: [PATCH] tls: Retain pipelined receive input with skb clones
+
+The buffered RX pipeline detaches each record by copying its ciphertext
+before consuming the TCP receive queue. That adds a full-record payload
+copy to TLS 1.3 receive and TLS 1.2 splice/read_sock even though the AEAD
+request reads its input and writes to a separate plaintext skb.
+
+Add tls_strp_msg_clone() to retain the input with a private wrapper and
+clones of the TCP skbs covering the record. The wrapper owns its frag_list
+links; cloning the parser anchor itself would leave it sharing the TCP
+queue links that the parser borrows and subsequently replaces. Preserve
+the record offset and length so adjacent records may share a TCP skb,
+and a record may span several skbs or page fragments without copying data.
+
+Acquire all references before consuming TCP input. Allocation failures
+free the partial clone chain and leave the current record unconsumed.
+Existing record retirement and purge release the clones, while a rekey
+reset keeps them available for speculative decryption retries. Preserve
+anchor detachment when the parser is already in copy mode. NIC offload
+continues to use the original detach path.
+
+Extend the existing TLS selftests with a ciphertext relay that queues ten
+mixed-size records using either one combined write or 1440-byte writes.
+Exercise splice/peek/recv transitions, record boundaries within the
+queued stream, and close with queued records on TLS 1.2 and TLS 1.3.
+
+Validation in QEMU TCG: all 1,016 TLS selftests pass on the 6.18 branch
+with native ciphers and again with asynchronous pcrypt wrappers. A focused
+90-test run passes on each branch with KASAN, including rekey, error and
+receive-buffer pressure cases. The 6.18 debug run reports the existing
+padata lock-class warning also seen on its unmodified baseline; the
+master debug run is warning-free. Kernel/selftest builds and checkpatch
+pass. Device throughput has not been measured.
+
+OpenAI Codex assisted with implementation, tests and this changelog in
+response to the request to remove the RX parser's ciphertext copy.
+
+(cherry picked from commit ca619b878ed913df3f12bb186616a6428a97357f
+ ("tls: Retain pipelined receive input with skb clones"))
+---
+ net/tls/tls.h      |  1 +
+ net/tls/tls_strp.c | 51 ++++++++++++++++++++++++++++++++++++++++++++++
+ net/tls/tls_sw.c   |  2 +-
+ 3 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/net/tls/tls.h b/net/tls/tls.h
+index 458b6ce34299..77dbb330245f 100644
+--- a/net/tls/tls.h
++++ b/net/tls/tls.h
+@@ -202,6 +202,7 @@ void tls_rx_msg_maybe_announce(struct tls_strparser *strp);
+ bool tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh);
+ int tls_strp_msg_cow(struct tls_sw_context_rx *ctx);
+ struct sk_buff *tls_strp_msg_detach(struct tls_sw_context_rx *ctx);
++struct sk_buff *tls_strp_msg_clone(struct tls_sw_context_rx *ctx);
+ int tls_strp_msg_hold(struct tls_strparser *strp, struct sk_buff_head *dst);
+ 
+ static inline struct tls_msg *tls_msg(struct sk_buff *skb)
+diff --git a/net/tls/tls_strp.c b/net/tls/tls_strp.c
+index 100a7693dc88..94e3122f31f0 100644
+--- a/net/tls/tls_strp.c
++++ b/net/tls/tls_strp.c
+@@ -104,6 +104,57 @@ struct sk_buff *tls_strp_msg_detach(struct tls_sw_context_rx *ctx)
+ 	return tls_strp_msg_make_copy(strp);
+ }
+ 
++/* Retain read-only input after consuming the TCP queue. The anchor borrows
++ * that queue's links, so each record needs its own chain of skb clones.
++ */
++struct sk_buff *tls_strp_msg_clone(struct tls_sw_context_rx *ctx)
++{
++	struct tls_strparser *strp = &ctx->strp;
++	struct sk_buff *skb, *iter, *clone, **next;
++	int offset = strp->stm.offset;
++	int len = strp->stm.full_len;
++
++	if (strp->copy_mode)
++		return tls_strp_msg_detach(ctx);
++
++	skb = alloc_skb(0, strp->sk->sk_allocation);
++	if (!skb)
++		return NULL;
++
++	skb_copy_header(skb, strp->anchor);
++	next = &skb_shinfo(skb)->frag_list;
++	iter = skb_shinfo(strp->anchor)->frag_list;
++	for (; len > 0; iter = iter->next) {
++		if (iter->len <= offset) {
++			offset -= iter->len;
++			continue;
++		}
++
++		clone = skb_clone(iter, strp->sk->sk_allocation);
++		if (!clone)
++			goto err_free;
++
++		if (!skb->len)
++			strp_msg(skb)->offset = offset;
++		*next = clone;
++		next = &clone->next;
++		skb->len += clone->len;
++		skb->data_len += clone->len;
++		skb->truesize += clone->truesize;
++		len -= clone->len - offset;
++		offset = 0;
++	}
++
++	/* Keep whole skbs shared. The record offset and length delimit input,
++	 * including when several records occupy the same TCP skb.
++	 */
++	return skb;
++
++err_free:
++	kfree_skb(skb);
++	return NULL;
++}
++
+ /* Force the input skb to be in copy mode. The data ownership remains
+  * with the input skb itself (meaning unpause will wipe it) but it can
+  * be modified.
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index 8a7e29b690d0..f33b710f8682 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -1982,7 +1982,7 @@ static int tls_rx_batch_collect(struct tls_sw_context_rx *ctx)
+ 			err = -ENOMEM;
+ 			break;
+ 		}
+-		rec->skb = tls_strp_msg_detach(ctx);
++		rec->skb = tls_strp_msg_clone(ctx);
+ 		if (!rec->skb) {
+ 			kfree(rec);
+ 			err = -ENOMEM;
+-- 
+2.52.0
+

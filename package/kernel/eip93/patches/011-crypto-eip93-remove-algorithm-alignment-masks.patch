@@ -1,0 +1,221 @@
+From 4d05507ecaf05313ac7ac88892e12be768b421a5 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:36:48 +0800
+Subject: [PATCH] crypto: eip93 - remove algorithm alignment masks
+
+The AES skciphers advertise a 16-byte Crypto API alignment requirement,
+although the driver already validates DMA scatterlists and bounces those
+that fail its hardware or cache-line checks. Keys and IVs are copied into
+private storage, and aes_expandkey() accepts unaligned input.
+
+Drop the nonzero AES skcipher masks and redundant zero initializers in
+the other skcipher and AEAD registrations. The implicit zero mask avoids
+imposing an additional caller alignment requirement. Keep the driver's
+DMA alignment checks and bounce handling unchanged.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-aead.c   | 16 ----------------
+ eip93-cipher.c |  8 --------
+ 2 files changed, 24 deletions(-)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 1f1a108..deddafb 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -230,7 +230,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_md5_cbc_aes = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -258,7 +257,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha1_cbc_aes = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -286,7 +284,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha224_cbc_aes = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -314,7 +311,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha256_cbc_aes = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -343,7 +339,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_md5_rfc3686_aes = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -372,7 +367,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha1_rfc3686_aes = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -401,7 +395,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha224_rfc3686_aes = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -430,7 +423,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha256_rfc3686_aes = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -458,7 +450,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_md5_cbc_des = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -486,7 +477,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha1_cbc_des = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -514,7 +504,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha224_cbc_des = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -542,7 +531,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha256_cbc_des = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -570,7 +558,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_md5_cbc_des3_ede = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0x0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -598,7 +585,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha1_cbc_des3_ede = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0x0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -626,7 +612,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha224_cbc_des3_ede = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0x0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -654,7 +639,6 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha256_cbc_des3_ede = {
+ 					CRYPTO_ALG_ALLOCATES_MEMORY,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0x0,
+ 			.cra_init = eip93_aead_cra_init,
+ 			.cra_exit = eip93_aead_cra_exit,
+ 			.cra_module = THIS_MODULE,
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index 6aacd9c..c6a4f52 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -256,7 +256,6 @@ struct eip93_alg_template eip93_alg_ecb_aes = {
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0xf,
+ 			.cra_init = eip93_skcipher_cra_init,
+ 			.cra_exit = eip93_skcipher_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -283,7 +282,6 @@ struct eip93_alg_template eip93_alg_cbc_aes = {
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0xf,
+ 			.cra_init = eip93_skcipher_cra_init,
+ 			.cra_exit = eip93_skcipher_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -310,7 +308,6 @@ struct eip93_alg_template eip93_alg_ctr_aes = {
+ 				     CRYPTO_ALG_KERN_DRIVER_ONLY,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0xf,
+ 			.cra_init = eip93_skcipher_cra_init,
+ 			.cra_exit = eip93_skcipher_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -337,7 +334,6 @@ struct eip93_alg_template eip93_alg_rfc3686_aes = {
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0xf,
+ 			.cra_init = eip93_skcipher_cra_init,
+ 			.cra_exit = eip93_skcipher_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -363,7 +359,6 @@ struct eip93_alg_template eip93_alg_ecb_des = {
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_skcipher_cra_init,
+ 			.cra_exit = eip93_skcipher_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -389,7 +384,6 @@ struct eip93_alg_template eip93_alg_cbc_des = {
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_skcipher_cra_init,
+ 			.cra_exit = eip93_skcipher_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -415,7 +409,6 @@ struct eip93_alg_template eip93_alg_ecb_des3_ede = {
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_skcipher_cra_init,
+ 			.cra_exit = eip93_skcipher_cra_exit,
+ 			.cra_module = THIS_MODULE,
+@@ -441,7 +434,6 @@ struct eip93_alg_template eip93_alg_cbc_des3_ede = {
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+-			.cra_alignmask = 0,
+ 			.cra_init = eip93_skcipher_cra_init,
+ 			.cra_exit = eip93_skcipher_cra_exit,
+ 			.cra_module = THIS_MODULE,

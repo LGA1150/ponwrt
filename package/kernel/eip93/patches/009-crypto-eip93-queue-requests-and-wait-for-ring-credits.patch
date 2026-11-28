@@ -1,0 +1,658 @@
+From fe30ff04bf3143ea91ec97c9c304956ff233c973 Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 11:24:50 +0800
+Subject: [PATCH 6/6] crypto: eip93 - queue requests and wait for ring credits
+
+Queue skcipher, AEAD and hash submissions on an ordered worker. Keep
+submitting independent requests until the hardware ring or request IDs
+are full, then sleep on credits returned by the completion tasklet. A
+request larger than the ring resumes as individual descriptors complete.
+
+Use the Crypto API queue backlog contract: accepted requests return
+EINPROGRESS, accepted backlog requests return EBUSY and receive an
+EINPROGRESS notification when promoted. Requests without MAY_BACKLOG can
+be rejected with ENOSPC only when the software queue is full.
+
+Prepare DMA in sleepable worker context, complete preparation failures
+once, and drain queued and in-flight operations before stopping
+interrupts. This replaces the submission retry sleeps and prevents
+ordinary ID exhaustion from aborting a kTLS TX socket.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ Makefile       |   2 +-
+ eip93-aead.c   |   8 ++--
+ eip93-aead.h   |   2 +
+ eip93-cipher.c |  13 ++++++-
+ eip93-cipher.h |   2 +
+ eip93-common.c |  54 +++++++++++++-------------
+ eip93-common.h |   4 +-
+ eip93-hash.c   |  74 ++++++++++++++++++++++++------------
+ eip93-hash.h   |   9 +++++
+ eip93-main.c   |  15 +++++++-
+ eip93-main.h   |  19 +++++++++-
+ eip93-queue.c  | 100 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 12 files changed, 243 insertions(+), 59 deletions(-)
+ create mode 100644 eip93-queue.c
+
+diff --git a/Makefile b/Makefile
+index a3d3d36..0438f16 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,5 @@
+ obj-$(CONFIG_CRYPTO_DEV_EIP93) += crypto-hw-eip93.o
+ 
+-crypto-hw-eip93-y += eip93-main.o eip93-common.o
++crypto-hw-eip93-y += eip93-main.o eip93-common.o eip93-queue.o
+ crypto-hw-eip93-y += eip93-cipher.o eip93-aead.o
+ crypto-hw-eip93-y += eip93-hash.o
+diff --git a/eip93-aead.c b/eip93-aead.c
+index 1910e42..1f1a108 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -152,10 +152,10 @@ static int eip93_aead_setauthsize(struct crypto_aead *ctfm,
+ 	return 0;
+ }
+ 
+-static int eip93_aead_crypt(struct aead_request *req)
++int eip93_aead_submit(struct crypto_async_request *async)
+ {
++	struct aead_request *req = aead_request_cast(async);
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+-	struct crypto_async_request *async = &req->base;
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	struct eip93_device *eip93 = ctx->eip93;
+ 	struct crypto_aead *aead = crypto_aead_reqtfm(req);
+@@ -195,7 +195,7 @@ static int eip93_aead_encrypt(struct aead_request *req)
+ 	rctx->flags = ctx->flags;
+ 	rctx->flags |= EIP93_ENCRYPT;
+ 
+-	return eip93_aead_crypt(req);
++	return eip93_enqueue(ctx->eip93, &req->base);
+ }
+ 
+ static int eip93_aead_decrypt(struct aead_request *req)
+@@ -206,7 +206,7 @@ static int eip93_aead_decrypt(struct aead_request *req)
+ 	rctx->flags = ctx->flags;
+ 	rctx->flags |= EIP93_DECRYPT;
+ 
+-	return eip93_aead_crypt(req);
++	return eip93_enqueue(ctx->eip93, &req->base);
+ }
+ 
+ /* Available authenc algorithms in this module */
+diff --git a/eip93-aead.h b/eip93-aead.h
+index e2fa8fd..c2fae65 100644
+--- a/eip93-aead.h
++++ b/eip93-aead.h
+@@ -33,6 +33,8 @@ extern struct eip93_alg_template eip93_alg_authenc_hmac_sha1_ecb_null;
+ extern struct eip93_alg_template eip93_alg_authenc_hmac_sha224_ecb_null;
+ extern struct eip93_alg_template eip93_alg_authenc_hmac_sha256_ecb_null;
+ 
++int eip93_aead_submit(struct crypto_async_request *async);
++
+ void eip93_aead_handle_result(struct crypto_async_request *async, int err);
+ 
+ #endif /* _EIP93_AEAD_H_ */
+diff --git a/eip93-cipher.c b/eip93-cipher.c
+index cea6fc1..6aacd9c 100644
+--- a/eip93-cipher.c
++++ b/eip93-cipher.c
+@@ -149,7 +149,6 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 	struct eip93_device *eip93 = ctx->eip93;
+ 	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
+ 	bool fallback = eip93_skcipher_is_fallback(req->base.tfm, rctx->flags);
+-	int ret, request_id;
+ 
+ 	if (!req->cryptlen)
+ 		return 0;
+@@ -178,6 +177,18 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 				 crypto_skcipher_decrypt(&rctx->fallback_req);
+ 	}
+ 
++	return eip93_enqueue(eip93, async);
++}
++
++int eip93_skcipher_submit(struct crypto_async_request *async)
++{
++	struct skcipher_request *req = skcipher_request_cast(async);
++	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
++	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
++	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
++	struct eip93_device *eip93 = ctx->eip93;
++	int ret, request_id;
++
+ 	/* Reserve completion tracking before any DMA or bounce preparation. */
+ 	request_id = eip93_alloc_req_id(eip93, async);
+ 	if (request_id < 0)
+diff --git a/eip93-cipher.h b/eip93-cipher.h
+index 2c19f2e..7726a83 100644
+--- a/eip93-cipher.h
++++ b/eip93-cipher.h
+@@ -48,6 +48,8 @@ struct eip93_cipher_reqctx {
+ void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 		     struct scatterlist *reqsrc, struct scatterlist *reqdst);
+ 
++int eip93_skcipher_submit(struct crypto_async_request *async);
++
+ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err);
+ 
+ int eip93_send_req(struct crypto_async_request *async,
+diff --git a/eip93-common.c b/eip93-common.c
+index fdcebdf..d23e2cf 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -12,7 +12,6 @@
+ #include <crypto/sha1.h>
+ #include <crypto/sha2.h>
+ #include <linux/kernel.h>
+-#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/scatterlist.h>
+ 
+@@ -27,21 +26,40 @@ int eip93_alloc_req_id(struct eip93_device *eip93,
+ {
+ 	int id;
+ 
++	/* Only the submission worker reserves IDs; completions return credits. */
++	down(&eip93->ring->requests);
++	idr_preload(GFP_KERNEL);
+ 	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+ 		id = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
+-			       EIP93_RING_NUM - 1, GFP_ATOMIC);
++			       EIP93_RING_NUM - 1, GFP_NOWAIT);
++	idr_preload_end();
+ 
+-	if (id < 0)
++	if (id < 0) {
++		up(&eip93->ring->requests);
+ 		dev_err_ratelimited(eip93->dev,
+ 				    "Failed to allocate request ID: %d\n", id);
++	}
+ 
+ 	return id;
+ }
+ 
+-void eip93_free_req_id(struct eip93_device *eip93, int id)
++struct crypto_async_request *eip93_take_req(struct eip93_device *eip93, int id)
+ {
++	struct crypto_async_request *async;
++
+ 	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+-		idr_remove(&eip93->ring->crypto_async_idr, id);
++		async = idr_remove(&eip93->ring->crypto_async_idr, id);
++	if (async) {
++		up(&eip93->ring->requests);
++		wake_up(&eip93->ring->idle);
++	}
++
++	return async;
++}
++
++void eip93_free_req_id(struct eip93_device *eip93, int id)
++{
++	eip93_take_req(eip93, id);
+ }
+ 
+ int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err)
+@@ -95,18 +113,16 @@ static void eip93_ring_advance(struct eip93_desc_ring *ring, void **ptr)
+ 		*ptr += ring->offset;
+ }
+ 
+-int eip93_put_descriptor(struct eip93_device *eip93,
+-			 struct eip93_descriptor *desc)
++void eip93_put_descriptor(struct eip93_device *eip93,
++			  struct eip93_descriptor *desc)
+ {
+ 	struct eip93_desc_ring *cdr = &eip93->ring->cdr;
+ 	struct eip93_desc_ring *rdr = &eip93->ring->rdr;
+ 
++	/* A request may span more than one ring; wait for each free slot. */
++	down(&eip93->ring->slots);
+ 	guard(spinlock_irqsave)(&eip93->ring->lock);
+ 
+-	if ((cdr->write == cdr->read - cdr->offset) ||
+-	    (cdr->read == cdr->base && cdr->write == cdr->base_end))
+-		return -ENOSPC;
+-
+ 	memset(rdr->write, 0, sizeof(struct eip93_descriptor));
+ 	memcpy(cdr->write, desc, sizeof(struct eip93_descriptor));
+ 	eip93_ring_advance(cdr, &cdr->write);
+@@ -115,8 +131,6 @@ int eip93_put_descriptor(struct eip93_device *eip93,
+ 	/* Publish the descriptor before ringing the doorbell. */
+ 	dma_wmb();
+ 	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
+-
+-	return 0;
+ }
+ 
+ int eip93_get_descriptor(struct eip93_device *eip93,
+@@ -149,6 +163,7 @@ int eip93_get_descriptor(struct eip93_device *eip93,
+ 	writel(1, eip93->base + EIP93_REG_PE_RD_COUNT);
+ 	eip93_ring_advance(cdr, &cdr->read);
+ 	eip93_ring_advance(rdr, &rdr->read);
++	up(&eip93->ring->slots);
+ 
+ 	return 0;
+ }
+@@ -409,7 +424,6 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 	bool nextin = false;
+ 	bool nextout = false;
+ 	int offsetout = 0;
+-	int err;
+ 
+ 	if (IS_ECB(rctx->flags))
+ 		rctx->sa_state_base = 0;
+@@ -505,17 +519,7 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 			cdesc->user_id |= FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS,
+ 						     EIP93_DESC_LAST);
+ 
+-		/*
+-		 * Loop - Delay - No need to rollback
+-		 * Maybe refine by slowing down at EIP93_RING_BUSY
+-		 */
+-again:
+-		err = eip93_put_descriptor(eip93, cdesc);
+-		if (err) {
+-			usleep_range(EIP93_RING_BUSY_DELAY,
+-				     EIP93_RING_BUSY_DELAY * 2);
+-			goto again;
+-		}
++		eip93_put_descriptor(eip93, cdesc);
+ 	} while (n);
+ 
+ 	return -EINPROGRESS;
+diff --git a/eip93-common.h b/eip93-common.h
+index 3f69990..26e7db3 100644
+--- a/eip93-common.h
++++ b/eip93-common.h
+@@ -11,11 +11,13 @@
+ 
+ int eip93_alloc_req_id(struct eip93_device *eip93,
+ 		       struct crypto_async_request *async);
++struct crypto_async_request *eip93_take_req(struct eip93_device *eip93, int id);
+ void eip93_free_req_id(struct eip93_device *eip93, int id);
+ 
+ int eip93_get_descriptor(struct eip93_device *eip93,
+ 			 struct eip93_descriptor *desc);
+-int eip93_put_descriptor(struct eip93_device *eip93, struct eip93_descriptor *desc);
++void eip93_put_descriptor(struct eip93_device *eip93,
++			  struct eip93_descriptor *desc);
+ 
+ void eip93_set_sa_record(struct sa_record *sa_record, const unsigned int keylen,
+ 			 const u32 flags);
+diff --git a/eip93-hash.c b/eip93-hash.c
+index ea03c46..e6d63b3 100644
+--- a/eip93-hash.c
++++ b/eip93-hash.c
+@@ -10,7 +10,6 @@
+ #include <crypto/md5.h>
+ #include <crypto/hmac.h>
+ #include <linux/dma-mapping.h>
+-#include <linux/delay.h>
+ 
+ #include "eip93-cipher.h"
+ #include "eip93-hash.h"
+@@ -272,21 +271,6 @@ static int eip93_prepare_hash_req(struct crypto_async_request *async, u8 *data,
+ 	return 0;
+ }
+ 
+-static void eip93_send_hash_req(struct eip93_device *eip93,
+-				struct eip93_descriptor *cdesc)
+-{
+-	int ret;
+-
+-again:
+-	ret = eip93_put_descriptor(eip93, cdesc);
+-	if (ret) {
+-		usleep_range(EIP93_RING_BUSY_DELAY,
+-			     EIP93_RING_BUSY_DELAY * 2);
+-		goto again;
+-	}
+-
+-}
+-
+ static int eip93_hash_init(struct ahash_request *req)
+ {
+ 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+@@ -339,7 +323,7 @@ static int __eip93_hash_update(struct ahash_request *req, bool complete_req)
+ 	 * and then reset to SHA256_BLOCK_SIZE.
+ 	 */
+ 	while (to_consume > max_read) {
+-		block = kzalloc(sizeof(*block), GFP_ATOMIC);
++		block = kzalloc(sizeof(*block), GFP_KERNEL);
+ 		if (!block) {
+ 			ret = -ENOMEM;
+ 			goto free_blocks;
+@@ -389,7 +373,7 @@ static int __eip93_hash_update(struct ahash_request *req, bool complete_req)
+ 	if (complete_req) {
+ 		list_for_each_entry_reverse(block, &rctx->blocks, list) {
+ 			wait_req = list_is_first(&block->list, &rctx->blocks);
+-			eip93_send_hash_req(ctx->eip93, &block->desc);
++			eip93_put_descriptor(ctx->eip93, &block->desc);
+ 			/* Completion may free the list immediately after submission. */
+ 			if (wait_req)
+ 				return -EINPROGRESS;
+@@ -404,7 +388,7 @@ free_blocks:
+ 	return ret;
+ }
+ 
+-static int eip93_hash_update(struct ahash_request *req)
++static int eip93_hash_do_update(struct ahash_request *req)
+ {
+ 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+ 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
+@@ -526,8 +510,8 @@ static int __eip93_hash_final(struct ahash_request *req, bool map_dma)
+ 		goto free_blocks;
+ 
+ 	list_for_each_entry_reverse(block, &rctx->blocks, list)
+-		eip93_send_hash_req(eip93, &block->desc);
+-	eip93_send_hash_req(eip93, &rctx->desc);
++		eip93_put_descriptor(eip93, &block->desc);
++	eip93_put_descriptor(eip93, &rctx->desc);
+ 
+ 	return -EINPROGRESS;
+ 
+@@ -544,7 +528,7 @@ free_sa_state:
+ 	return ret;
+ }
+ 
+-static int eip93_hash_final(struct ahash_request *req)
++static int eip93_hash_do_final(struct ahash_request *req)
+ {
+ 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+ 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
+@@ -566,7 +550,7 @@ static int eip93_hash_final(struct ahash_request *req)
+ 	return ret;
+ }
+ 
+-static int eip93_hash_finup(struct ahash_request *req)
++static int eip93_hash_do_finup(struct ahash_request *req)
+ {
+ 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+ 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
+@@ -625,6 +609,50 @@ free_request_id:
+ 	return ret;
+ }
+ 
++int eip93_hash_submit(struct crypto_async_request *async)
++{
++	struct ahash_request *req = ahash_request_cast(async);
++	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
++
++	switch (rctx->op) {
++	case EIP93_HASH_UPDATE:
++		return eip93_hash_do_update(req);
++	case EIP93_HASH_FINAL:
++		return eip93_hash_do_final(req);
++	case EIP93_HASH_FINUP:
++		return eip93_hash_do_finup(req);
++	}
++
++	return -EINVAL;
++}
++
++static int eip93_hash_enqueue(struct ahash_request *req, enum eip93_hash_op op)
++{
++	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
++	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(req));
++
++	rctx->op = op;
++	return eip93_enqueue(ctx->eip93, &req->base);
++}
++
++static int eip93_hash_update(struct ahash_request *req)
++{
++	if (!req->nbytes)
++		return 0;
++
++	return eip93_hash_enqueue(req, EIP93_HASH_UPDATE);
++}
++
++static int eip93_hash_final(struct ahash_request *req)
++{
++	return eip93_hash_enqueue(req, EIP93_HASH_FINAL);
++}
++
++static int eip93_hash_finup(struct ahash_request *req)
++{
++	return eip93_hash_enqueue(req, EIP93_HASH_FINUP);
++}
++
+ static int eip93_hash_hmac_setkey(struct crypto_ahash *ahash, const u8 *key,
+ 				  u32 keylen)
+ {
+diff --git a/eip93-hash.h b/eip93-hash.h
+index b06fa68..719142f 100644
+--- a/eip93-hash.h
++++ b/eip93-hash.h
+@@ -21,6 +21,12 @@ struct eip93_hash_ctx {
+ 	u8			opad[SHA256_DIGEST_SIZE] __aligned(sizeof(u32));
+ };
+ 
++enum eip93_hash_op {
++	EIP93_HASH_UPDATE,
++	EIP93_HASH_FINAL,
++	EIP93_HASH_FINUP,
++};
++
+ struct eip93_hash_reqctx {
+ 	/* Placement is important for DMA align */
+ 	struct {
+@@ -33,6 +39,7 @@ struct eip93_hash_reqctx {
+ 	dma_addr_t		sa_record_hmac_base;
+ 	dma_addr_t		sa_state_base;
+ 	int			request_id;
++	enum eip93_hash_op	op;
+ 	bool			hmac_mapped;
+ 	bool			data_mapped;
+ 	struct eip93_descriptor	desc;
+@@ -74,6 +81,8 @@ struct eip93_hash_export_state {
+ 	u8			data[SHA256_BLOCK_SIZE] __aligned(sizeof(u32));
+ };
+ 
++int eip93_hash_submit(struct crypto_async_request *async);
++
+ void eip93_hash_handle_result(struct crypto_async_request *async, int err);
+ 
+ extern struct eip93_alg_template eip93_alg_md5;
+diff --git a/eip93-main.c b/eip93-main.c
+index f6360b4..4707ff3 100644
+--- a/eip93-main.c
++++ b/eip93-main.c
+@@ -242,8 +242,7 @@ get_more:
+ 		goto get_more;
+ 
+ 	/* Get crypto async ref only for last descriptor */
+-	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+-		async = idr_remove(&eip93->ring->crypto_async_idr, crypto_idr);
++	async = eip93_take_req(eip93, crypto_idr);
+ 	if (!async) {
+ 		dev_err_ratelimited(eip93->dev,
+ 				    "Missing request: id=%#x flags=%#x ctrl=%#x len=%#x\n",
+@@ -392,6 +391,9 @@ static int eip93_desc_init(struct eip93_device *eip93)
+ 
+ static void eip93_cleanup(struct eip93_device *eip93)
+ {
++	/* Drain submission and hardware while completion interrupts still run. */
++	eip93_queue_exit(eip93);
++	disable_irq(eip93->irq);
+ 	tasklet_kill(&eip93->ring->done_task);
+ 
+ 	/* Clear/ack all interrupts before disable all */
+@@ -448,6 +450,15 @@ static int eip93_crypto_probe(struct platform_device *pdev)
+ 
+ 	spin_lock_init(&eip93->ring->idr_lock);
+ 	idr_init(&eip93->ring->crypto_async_idr);
++	sema_init(&eip93->ring->requests, EIP93_RING_NUM - 1);
++	sema_init(&eip93->ring->slots, EIP93_RING_NUM - 1);
++	init_waitqueue_head(&eip93->ring->idle);
++
++	ret = eip93_queue_init(eip93);
++	if (ret) {
++		idr_destroy(&eip93->ring->crypto_async_idr);
++		return ret;
++	}
+ 
+ 	algo_flags = readl(eip93->base + EIP93_REG_PE_OPTION_1);
+ 
+diff --git a/eip93-main.h b/eip93-main.h
+index e4219f6..fd514ac 100644
+--- a/eip93-main.h
++++ b/eip93-main.h
+@@ -8,13 +8,15 @@
+ #ifndef _EIP93_MAIN_H_
+ #define _EIP93_MAIN_H_
+ 
++#include <crypto/algapi.h>
+ #include <crypto/internal/aead.h>
+ #include <crypto/internal/hash.h>
+ #include <crypto/internal/skcipher.h>
+ #include <linux/bitfield.h>
+ #include <linux/interrupt.h>
+-
+-#define EIP93_RING_BUSY_DELAY		500
++#include <linux/semaphore.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
+ 
+ #define EIP93_RING_NUM			512
+ #define EIP93_RING_BUSY			32
+@@ -101,6 +103,12 @@ struct eip93_device {
+ 	struct clk		*clk;
+ 	int			irq;
+ 	struct eip93_ring		*ring;
++	struct crypto_queue		queue;
++	/* Protect queue membership, backlog promotion and shutdown. */
++	spinlock_t			queue_lock;
++	struct work_struct		work;
++	struct workqueue_struct		*wq;
++	bool				stopping;
+ };
+ 
+ struct eip93_desc_ring {
+@@ -129,6 +137,9 @@ struct eip93_ring {
+ 	/* aync idr */
+ 	spinlock_t			idr_lock;
+ 	struct idr			crypto_async_idr;
++	struct semaphore		requests;
++	struct semaphore		slots;
++	wait_queue_head_t		idle;
+ };
+ 
+ enum eip93_alg_type {
+@@ -148,4 +159,8 @@ struct eip93_alg_template {
+ 	} alg;
+ };
+ 
++int eip93_queue_init(struct eip93_device *eip93);
++void eip93_queue_exit(struct eip93_device *eip93);
++int eip93_enqueue(struct eip93_device *eip93, struct crypto_async_request *async);
++
+ #endif /* _EIP93_MAIN_H_ */
+diff --git a/eip93-queue.c b/eip93-queue.c
+new file mode 100644
+index 0000000..7681b0f
+--- /dev/null
++++ b/eip93-queue.c
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-2.0
++/* EIP93 software backlog and sleepable, pipelined submission. */
++
++#include <linux/device.h>
++
++#include "eip93-main.h"
++#include "eip93-aead.h"
++#include "eip93-cipher.h"
++#include "eip93-hash.h"
++
++static int eip93_submit(struct crypto_async_request *async)
++{
++	switch (crypto_tfm_alg_type(async->tfm)) {
++	case CRYPTO_ALG_TYPE_SKCIPHER:
++		return eip93_skcipher_submit(async);
++	case CRYPTO_ALG_TYPE_AEAD:
++		return eip93_aead_submit(async);
++	case CRYPTO_ALG_TYPE_AHASH:
++		return eip93_hash_submit(async);
++	}
++
++	return -EINVAL;
++}
++
++static void eip93_complete(struct crypto_async_request *async, int err)
++{
++	/* Match the bottom-half context of hardware completions. */
++	local_bh_disable();
++	crypto_request_complete(async, err);
++	local_bh_enable();
++}
++
++static void eip93_work(struct work_struct *work)
++{
++	struct eip93_device *eip93 = container_of(work, struct eip93_device, work);
++	struct crypto_async_request *async, *backlog;
++	int err;
++
++	for (;;) {
++		scoped_guard(spinlock_bh, &eip93->queue_lock) {
++			backlog = crypto_get_backlog(&eip93->queue);
++			async = crypto_dequeue_request(&eip93->queue);
++		}
++		if (!async)
++			return;
++
++		if (backlog)
++			eip93_complete(backlog, -EINPROGRESS);
++
++		/* Submission sleeps only when IDs or ring slots are exhausted. */
++		err = eip93_submit(async);
++		if (err != -EINPROGRESS)
++			eip93_complete(async, err);
++		/* async may already have completed and been freed. */
++	}
++}
++
++int eip93_enqueue(struct eip93_device *eip93, struct crypto_async_request *async)
++{
++	int err;
++
++	guard(spinlock_bh)(&eip93->queue_lock);
++
++	if (eip93->stopping)
++		return -ESHUTDOWN;
++
++	err = crypto_enqueue_request(&eip93->queue, async);
++	if (err == -EINPROGRESS || err == -EBUSY)
++		queue_work(eip93->wq, &eip93->work);
++
++	return err;
++}
++
++int eip93_queue_init(struct eip93_device *eip93)
++{
++	spin_lock_init(&eip93->queue_lock);
++	crypto_init_queue(&eip93->queue, EIP93_RING_NUM - 1);
++	INIT_WORK(&eip93->work, eip93_work);
++	eip93->wq = alloc_ordered_workqueue("eip93-%s", WQ_MEM_RECLAIM,
++					    dev_name(eip93->dev));
++	if (!eip93->wq)
++		return -ENOMEM;
++
++	return 0;
++}
++
++static bool eip93_idle(struct eip93_device *eip93)
++{
++	guard(spinlock_bh)(&eip93->ring->idr_lock);
++
++	return idr_is_empty(&eip93->ring->crypto_async_idr);
++}
++
++void eip93_queue_exit(struct eip93_device *eip93)
++{
++	scoped_guard(spinlock_bh, &eip93->queue_lock)
++		eip93->stopping = true;
++	destroy_workqueue(eip93->wq);
++	wait_event(eip93->ring->idle, eip93_idle(eip93));
++}

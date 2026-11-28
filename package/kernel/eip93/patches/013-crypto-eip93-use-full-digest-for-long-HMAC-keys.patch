@@ -1,0 +1,89 @@
+From e0cd055503800424bfb7a260d4c71150e2e72c8b Mon Sep 17 00:00:00 2001
+From: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 15:11:07 +0800
+Subject: [PATCH] crypto: eip93 - use the full digest when shortening HMAC keys
+
+HMAC hashes keys longer than the hash block size before constructing the
+inner and outer pads. The authenc caller passes its authentication tag
+length to eip93_hmac_setkey(), which incorrectly discards part of that
+key digest when the tag is truncated. For example, HMAC-SHA256 with a
+131-byte key and a 16-byte tag uses only half of the hashed key.
+
+Take the normalized key length from the selected hash transform. Remove
+the caller-supplied length so tag truncation and setauthsize ordering
+cannot affect HMAC key normalization.
+
+Signed-off-by: LGA1150 <9155358+LGA1150@users.noreply.github.com>
+---
+ eip93-aead.c   | 2 +-
+ eip93-common.c | 5 ++---
+ eip93-common.h | 3 +--
+ eip93-hash.c   | 3 +--
+ 4 files changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/eip93-aead.c b/eip93-aead.c
+index deddafb..9704f77 100644
+--- a/eip93-aead.c
++++ b/eip93-aead.c
+@@ -131,7 +131,7 @@ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+ 
+ 	/* authentication key */
+ 	ret = eip93_hmac_setkey(ctx->flags, keys.authkey, keys.authkeylen,
+-				ctx->authsize, sa_record->sa_i_digest,
++				sa_record->sa_i_digest,
+ 				sa_record->sa_o_digest, false);
+ 
+ 
+diff --git a/eip93-common.c b/eip93-common.c
+index 07c490d..f26222b 100644
+--- a/eip93-common.c
++++ b/eip93-common.c
+@@ -778,8 +778,7 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx
+ }
+ 
+ int eip93_hmac_setkey(u32 ctx_flags, const u8 *key, unsigned int keylen,
+-		      unsigned int hashlen, u8 *dest_ipad, u8 *dest_opad,
+-		      bool skip_ipad)
++		      u8 *dest_ipad, u8 *dest_opad, bool skip_ipad)
+ {
+ 	u8 ipad[SHA256_BLOCK_SIZE], opad[SHA256_BLOCK_SIZE];
+ 	struct crypto_ahash *ahash_tfm;
+@@ -831,7 +830,7 @@ int eip93_hmac_setkey(u32 ctx_flags, const u8 *key, unsigned int keylen,
+ 		if (ret)
+ 			goto err_req;
+ 
+-		keylen = hashlen;
++		keylen = crypto_ahash_digestsize(ahash_tfm);
+ 	} else {
+ 		memcpy(ipad, key, keylen);
+ 	}
+diff --git a/eip93-common.h b/eip93-common.h
+index 26e7db3..400a6f2 100644
+--- a/eip93-common.h
++++ b/eip93-common.h
+@@ -25,7 +25,6 @@ void eip93_set_sa_record(struct sa_record *sa_record, const unsigned int keylen,
+ int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err);
+ 
+ int eip93_hmac_setkey(u32 ctx_flags, const u8 *key, unsigned int keylen,
+-		      unsigned int hashlen, u8 *ipad, u8 *opad,
+-		      bool skip_ipad);
++		      u8 *ipad, u8 *opad, bool skip_ipad);
+ 
+ #endif /* _EIP93_COMMON_H_ */
+diff --git a/eip93-hash.c b/eip93-hash.c
+index e6d63b3..2314cee 100644
+--- a/eip93-hash.c
++++ b/eip93-hash.c
+@@ -656,11 +656,10 @@ static int eip93_hash_finup(struct ahash_request *req)
+ static int eip93_hash_hmac_setkey(struct crypto_ahash *ahash, const u8 *key,
+ 				  u32 keylen)
+ {
+-	unsigned int digestsize = crypto_ahash_digestsize(ahash);
+ 	struct crypto_tfm *tfm = crypto_ahash_tfm(ahash);
+ 	struct eip93_hash_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	return eip93_hmac_setkey(ctx->flags, key, keylen, digestsize,
++	return eip93_hmac_setkey(ctx->flags, key, keylen,
+ 				 ctx->ipad, ctx->opad, true);
+ }
+ 

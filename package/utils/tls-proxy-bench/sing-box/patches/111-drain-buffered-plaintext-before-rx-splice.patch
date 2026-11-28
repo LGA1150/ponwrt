@@ -1,0 +1,214 @@
+Subject: [PATCH] ktls: drain buffered plaintext before RX splice
+
+A short Conn.Read reads a whole kTLS record into rawConn.Input, then
+returns only the bytes requested by the caller. Exposing the socket to
+splice at this point skips any plaintext left in that userspace buffer.
+
+For example, Trojan fallback reads a 56-byte key from a 64-byte setup
+record. The fallback wrapper forwards those 56 bytes, but the remaining
+eight bytes are stranded in rawConn.Input when forwarding switches to
+splice. A peer waiting for the complete header times out even if the
+subsequent benchmark traffic would flow in the TX direction.
+
+Implement network.CachedReader so sing's copy loop drains the remaining
+plaintext before selecting splice. Return an owned buffer because later
+record reads reuse the TLS input storage. Also decline raw RX access
+while plaintext remains buffered, for callers which bypass the cache
+handling in the copy loop.
+
+Add a TCP-splice regression test for the short-read/fallback handoff,
+and check buffer ownership and raw-socket availability before and after
+draining. These tests do not require kernel TLS keys: the handoff test
+models a record already fetched into the TLS reader and uses a plaintext
+TCP socket for data still available to splice.
+
+Based on sing-box v1.14.3. Apply after
+110-allow-server-side-ktls-rx-splice.patch.
+
+--- a/common/ktls/ktls.go
++++ b/common/ktls/ktls.go
+@@ -94,6 +94,11 @@
+ 	if !c.kernelRx {
+ 		return nil
+ 	}
++	c.rawConn.In.Lock()
++	defer c.rawConn.In.Unlock()
++	if c.rawConn.Input.Len() > 0 {
++		return nil
++	}
+ 	c.logger.DebugContext(c.ctx, "ktls: RX splice requested")
+ 	return c.rawSyscallConn
+ }
+--- a/common/ktls/ktls_read.go
++++ b/common/ktls/ktls_read.go
+@@ -13,7 +13,21 @@
+ 	"io"
+ 	"net"
+ 	"unsafe"
++
++	"github.com/sagernet/sing/common/buf"
+ )
++
++func (c *Conn) ReadCached() *buf.Buffer {
++	c.rawConn.In.Lock()
++	defer c.rawConn.In.Unlock()
++	if c.rawConn.Input.Len() == 0 {
++		return nil
++	}
++	// The record storage is reused by the next read, so return an owned copy.
++	buffer := buf.NewSize(c.rawConn.Input.Len())
++	_, _ = buffer.ReadOnceFrom(c.rawConn.Input)
++	return buffer
++}
+ 
+ func (c *Conn) Read(b []byte) (int, error) {
+ 	if !c.kernelRx {
+--- /dev/null
++++ b/common/ktls/ktls_cached_test.go
+@@ -0,0 +1,146 @@
++//go:build linux && go1.25 && badlinkname
++
++package ktls
++
++import (
++	"bytes"
++	"context"
++	"crypto/tls"
++	"io"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/common/badtls"
++	"github.com/sagernet/sing/common/buf"
++	"github.com/sagernet/sing/common/bufio"
++	"github.com/sagernet/sing/common/logger"
++	N "github.com/sagernet/sing/common/network"
++)
++
++func cachedTestTCPPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
++	t.Helper()
++	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { client.Close() })
++	server, err := listener.AcceptTCP()
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { server.Close() })
++	deadline := time.Now().Add(5 * time.Second)
++	if err = client.SetDeadline(deadline); err != nil {
++		t.Fatal(err)
++	}
++	if err = server.SetDeadline(deadline); err != nil {
++		t.Fatal(err)
++	}
++	return client, server
++}
++
++func cachedTestConn(t *testing.T, socket *net.TCPConn, plaintext []byte) *Conn {
++	t.Helper()
++	raw, err := socket.SyscallConn()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return &Conn{
++		Conn:           tls.Server(socket, &tls.Config{}),
++		ctx:            context.Background(),
++		logger:         logger.NOP(),
++		kernelRx:       true,
++		rawSyscallConn: raw,
++		rawConn: &badtls.RawConn{
++			Input:    bytes.NewReader(plaintext),
++			RawInput: new(bytes.Buffer),
++			In:       &badtls.RawHalfConn{Mutex: new(sync.Mutex)},
++		},
++	}
++}
++
++func TestCopyBufferedTLSRecordBeforeSplice(t *testing.T) {
++	peer, socket := cachedTestTCPPair(t)
++	backend, destination := cachedTestTCPPair(t)
++	header := bytes.Repeat([]byte("abcdefgh"), 8)
++	payload := bytes.Repeat([]byte("next-record"), 128)
++	// Model a record already read by kTLS, followed by plaintext still in
++	// the kernel. This exercises the copy handoff without kernel TLS keys.
++	conn := cachedTestConn(t, socket, header)
++	var prefix [56]byte
++	if _, err := io.ReadFull(conn, prefix[:]); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := peer.Write(payload); err != nil {
++		t.Fatal(err)
++	}
++	if err := peer.CloseWrite(); err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() {
++		_, err := bufio.Copy(destination, bufio.NewCachedConn(conn, buf.As(prefix[:]).ToOwned()))
++		destination.CloseWrite()
++		done <- err
++	}()
++	want := append(append([]byte(nil), header...), payload...)
++	got := make([]byte, len(want))
++	n, readErr := io.ReadFull(backend, got)
++	copyErr := <-done
++	if readErr != nil {
++		t.Fatalf("forwarded %d/%d bytes: %v (copy: %v)", n, len(want), readErr, copyErr)
++	}
++	if copyErr != nil {
++		t.Fatal(copyErr)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatal("buffered plaintext was skipped, duplicated, or reordered")
++	}
++	if conn.rawConn.Input.Len() != 0 {
++		t.Fatal("TLS plaintext remains buffered after copy")
++	}
++}
++
++func TestReadCachedBeforeRawSocket(t *testing.T) {
++	_, socket := cachedTestTCPPair(t)
++	record := []byte("consumedremaining")
++	conn := cachedTestConn(t, socket, record)
++	var consumed [8]byte
++	if _, err := io.ReadFull(conn, consumed[:]); err != nil {
++		t.Fatal(err)
++	}
++	if conn.SyscallConnForRead() != nil {
++		t.Fatal("raw socket exposed with unread TLS plaintext")
++	}
++	cached, ok := any(conn).(N.CachedReader)
++	if !ok {
++		t.Fatal("kTLS connection does not expose cached plaintext")
++	}
++	buffer := cached.ReadCached()
++	if buffer == nil {
++		t.Fatal("missing cached plaintext")
++	}
++	defer buffer.Release()
++	clear(record)
++	conn.rawConn.Input.Reset(nil)
++	if !bytes.Equal(buffer.Bytes(), []byte("remaining")) {
++		t.Fatal("returned buffer aliases reusable TLS storage")
++	}
++	if cached.ReadCached() != nil {
++		t.Fatal("cached plaintext returned more than once")
++	}
++	if conn.SyscallConnForRead() == nil {
++		t.Fatal("raw socket unavailable after draining plaintext")
++	}
++	conn.kernelRx = false
++	if conn.SyscallConnForRead() != nil {
++		t.Fatal("raw socket exposed without kernel RX")
++	}
++}
